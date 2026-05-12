@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -13,7 +13,13 @@ import streamlit as st
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 ANNOTATION_DIR = DATA_DIR / "annotations"
-CSV_CANDIDATES = [DATA_DIR / "review_samples.csv", APP_DIR / "review_samples.csv", Path("/mnt/data/review_samples.csv")]
+REVIEW_CSV = DATA_DIR / "review_samples.csv"
+APP_VERSION = "row_id_string_safe_score_aligned_2026_05_12"
+
+LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+QUESTION_TASKS = {"KP_Weak", "KP_Stage", "Planning_Progress", "Planning_Target"}
+ENTITY_TASKS = {"Personality_Individual", "Personality_Group"}
+ALL_BENCHMARKS = QUESTION_TASKS | ENTITY_TASKS
 
 TASK_LABELS = {
     "KP_Weak": "知识匹配：薄弱知识匹配",
@@ -27,11 +33,11 @@ TASK_LABELS = {
 TASK_GUIDANCE = {
     "KP_Weak": {
         "goal": "根据学生历史作答表现，选择最适合用于针对性补弱的候选题。",
-        "basis": ["优先关注历史中暴露出的薄弱知识点。", "候选题如果能针对这些知识点进行练习，则值得推荐。", "请选最值得优先推荐的一题。"],
+        "basis": ["优先关注历史中暴露出的薄弱知识点。", "候选题应能针对关键薄弱点练习。", "选择最值得优先推荐的一题。"],
     },
     "KP_Stage": {
         "goal": "根据学生历史题目与表现，选择最符合当前教学章节 / 知识阶段的候选题。",
-        "basis": ["重点看候选题是否符合当前教学章节。", "判断标准不是单纯难度高低。", "明显过早或过晚的题不应优先推荐。"],
+        "basis": ["重点判断候选题是否符合当前教学章节。", "不要只看难度高低。", "明显过早或过晚的题不应优先推荐。"],
     },
     "Planning_Progress": {
         "goal": "根据学生最近学习轨迹，选择最适合作为下一步练习的候选题。",
@@ -39,176 +45,132 @@ TASK_GUIDANCE = {
     },
     "Planning_Target": {
         "goal": "在给定学习目标下，选择最能推进该目标的候选题。",
-        "basis": ["显式学习目标是核心条件。", "优先考虑候选题是否真正服务目标。", "不要只看与历史题的表面相似。"],
+        "basis": ["显式学习目标是核心条件。", "候选题应真正服务学习目标。", "不要只看与历史题的表面相似。"],
     },
     "Personality_Individual": {
         "goal": "给定目标题目，从候选学生中选择最适合推荐这道题的学生。",
-        "basis": ["比较每个候选学生的历史表现与目标题所需能力。", "不要只看总体成绩。", "判断谁最适合这道具体题目。"],
+        "basis": ["比较候选学生历史表现与目标题所需能力。", "不要只看总体成绩。", "判断谁最适合这道具体题目。"],
     },
     "Personality_Group": {
         "goal": "给定目标题目，从候选学生组中选择最适合推荐这道题的学生组。",
-        "basis": ["比较小组整体能力结构与目标题的匹配程度。", "不要只看单个成员。", "判断哪个组最适合这道具体题目。"],
+        "basis": ["比较小组整体能力结构与目标题的匹配程度。", "关注组内成员结构，不只看单个成员。", "判断哪个组最适合这道具体题目。"],
     },
 }
 
-LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 SUP = str.maketrans("0123456789+-=()nix", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱˣ")
 SUB = str.maketrans("0123456789+-=()nix", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₙᵢₓ")
 
+REQUIRED_COLUMNS = [
+    "row_id",
+    "benchmark",
+    "task_type",
+    "task_label",
+    "case_type",
+    "sample_rank_in_case",
+    "best_model",
+    "sample_id",
+    "dataset",
+    "source",
+    "setting",
+    "teacher_check_focus",
+    "history_items_json",
+    "candidate_items_json",
+    "learning_goal",
+    "progress_state",
+    "weak_knowledge_points",
+    "stage_knowledge_points",
+    "target_question_json",
+    "target_question_text",
+    "candidate_entities_json",
+]
 
-def is_blank(value: Any) -> bool:
+
+def clean(value: Any) -> str:
     if value is None:
-        return True
-    try:
-        if pd.isna(value):
-            return True
-    except Exception:
-        pass
-    return str(value).strip().lower() in {"", "nan", "none", "null"}
-
-
-def clean_str(value: Any) -> str:
-    return "" if is_blank(value) else str(value).strip()
-
-
-def load_json(value: Any, default: Any) -> Any:
-    if is_blank(value):
-        return default
+        return ""
     text = str(value).strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        return default
+    return "" if text.lower() in {"", "nan", "none", "null"} else text
 
 
-def list_json(value: Any) -> list[dict[str, Any]]:
-    obj = load_json(value, [])
-    return obj if isinstance(obj, list) else []
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
 
 
-def dict_json(value: Any) -> dict[str, Any]:
-    obj = load_json(value, {})
-    return obj if isinstance(obj, dict) else {}
+def json_list(value: Any, field: str, row_id: str) -> list[dict[str, Any]]:
+    text = clean(value)
+    require(bool(text), f"row_id={row_id} 字段 {field} 不能为空")
+    obj = json.loads(text)
+    require(isinstance(obj, list), f"row_id={row_id} 字段 {field} 必须是 JSON list")
+    return obj
+
+
+def json_dict(value: Any, field: str, row_id: str) -> dict[str, Any]:
+    text = clean(value)
+    require(bool(text), f"row_id={row_id} 字段 {field} 不能为空")
+    obj = json.loads(text)
+    require(isinstance(obj, dict), f"row_id={row_id} 字段 {field} 必须是 JSON dict")
+    return obj
 
 
 def find_csv() -> Path:
-    for path in CSV_CANDIDATES:
-        if path.exists():
-            return path
-    raise FileNotFoundError("找不到 review_samples.csv。请放在 data/review_samples.csv 或 app.py 同目录。")
+    require(REVIEW_CSV.exists(), f"找不到 {REVIEW_CSV}。请把规范化后的 review_samples.csv 放到 data/review_samples.csv")
+    return REVIEW_CSV
 
 
 def load_samples() -> pd.DataFrame:
-    df = pd.read_csv(find_csv())
-    if "row_id" not in df.columns:
-        df.insert(0, "row_id", range(1, len(df) + 1))
-    for col in [
-        "benchmark", "task_type", "task_label", "learning_goal", "progress_state",
-        "weak_knowledge_points", "stage_knowledge_points", "target_question_json",
-        "target_question_text", "history_items_json", "candidate_items_json",
-        "candidate_entities_json", "history_preview", "candidate_preview", "teacher_check_focus",
-    ]:
-        if col not in df.columns:
-            df[col] = ""
+    df = pd.read_csv(find_csv(), dtype={"row_id": "string"})
+    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    require(not missing, "review_samples.csv 缺少必需字段：" + ", ".join(missing))
+    df["row_id"] = df["row_id"].astype(str)
+    validate_dataframe(df)
     return df
 
 
-def parse_prefixed_preview(text: Any) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    if is_blank(text):
-        return out
-    for idx, line in enumerate(str(text).splitlines(), start=1):
-        line = line.strip()
-        if not line:
-            continue
-        label = LETTERS[len(out)] if len(out) < len(LETTERS) else str(len(out) + 1)
-        body = line
-        m = re.match(r"^([A-Z]|C\d+|\d+)[.:：]\s*(.*)$", line)
-        if m:
-            label, body = m.group(1), m.group(2)
-            if label.startswith("C") and label[1:].isdigit():
-                num = int(label[1:]) - 1
-                label = LETTERS[num] if 0 <= num < len(LETTERS) else label
-        else:
-            m2 = re.match(r"^(\d+)\.\s*(?:[（(][^）)]*[）)]\s*)?(.*)$", line)
-            if m2:
-                body = m2.group(2)
-        out.append({"display_index": len(out) + 1, "label": label, "question_text": body, "text": body})
-    return out
+def validate_dataframe(df: pd.DataFrame) -> None:
+    invalid = sorted(set(df["benchmark"].astype(str)) - ALL_BENCHMARKS)
+    require(not invalid, "存在未知 benchmark：" + ", ".join(invalid))
+
+    for _, row in df.iterrows():
+        row_id = clean(row["row_id"])
+        benchmark = clean(row["benchmark"])
+        require(bool(row_id), "row_id 不能为空")
+
+        if benchmark in QUESTION_TASKS:
+            require(clean(row["task_type"]) == "question_recommendation", f"row_id={row_id} task_type 应为 question_recommendation")
+            history = json_list(row["history_items_json"], "history_items_json", row_id)
+            candidates = json_list(row["candidate_items_json"], "candidate_items_json", row_id)
+            require(len(history) > 0, f"row_id={row_id} history_items_json 不能为空列表")
+            require(len(candidates) > 0, f"row_id={row_id} candidate_items_json 不能为空列表")
+            for item in candidates:
+                require("is_gt" not in item, f"row_id={row_id} candidate_items_json 不能包含 is_gt")
+                require(clean(item.get("label")), f"row_id={row_id} 候选题缺少 label")
+                require(clean(item.get("question_text")), f"row_id={row_id} 候选题缺少 question_text")
+            if benchmark == "Planning_Target":
+                require(clean(row["learning_goal"]), f"row_id={row_id} Planning_Target 必须有 learning_goal")
+            if benchmark == "Planning_Progress":
+                require(clean(row["progress_state"]), f"row_id={row_id} Planning_Progress 必须有 progress_state")
+
+        if benchmark in ENTITY_TASKS:
+            require(clean(row["task_type"]) == "entity_recommendation", f"row_id={row_id} task_type 应为 entity_recommendation")
+            target = json_dict(row["target_question_json"], "target_question_json", row_id)
+            entities = json_list(row["candidate_entities_json"], "candidate_entities_json", row_id)
+            require(clean(target.get("question_text")), f"row_id={row_id} target_question_json 缺少 question_text")
+            require(len(entities) >= 2, f"row_id={row_id} candidate_entities_json 候选数必须 >= 2")
+            for entity in entities:
+                require("is_gt" not in entity, f"row_id={row_id} candidate_entities_json 不能包含 is_gt")
+                require(clean(entity.get("label")), f"row_id={row_id} 候选实体缺少 label")
+                require(clean(entity.get("title")), f"row_id={row_id} 候选实体缺少 title")
+                history = entity.get("history_items")
+                require(isinstance(history, list) and len(history) > 0, f"row_id={row_id} 候选实体 {entity.get('label')} 缺少 history_items")
+
+        for field in ["history_preview", "candidate_preview", "target_question_text", "learning_goal", "progress_state"]:
+            if field in df.columns:
+                text = clean(row.get(field, ""))
+                require("GT:" not in text and "is_gt" not in text and "correct_answer" not in text, f"row_id={row_id} 面向老师字段 {field} 出现泄漏标记")
 
 
-def ensure_label(item: dict[str, Any], idx: int) -> str:
-    label = clean_str(item.get("label"))
-    if label:
-        return label
-    return LETTERS[idx] if idx < len(LETTERS) else f"Option-{idx + 1}"
-
-
-def get_history_items(row: pd.Series) -> list[dict[str, Any]]:
-    items = list_json(row.get("history_items_json", ""))
-    if items:
-        return items
-    return parse_prefixed_preview(row.get("history_preview", ""))
-
-
-def get_question_candidates(row: pd.Series) -> list[dict[str, Any]]:
-    raw = list_json(row.get("candidate_items_json", ""))
-    if not raw:
-        raw = parse_prefixed_preview(row.get("candidate_preview", ""))
-    out: list[dict[str, Any]] = []
-    for idx, item in enumerate(raw):
-        text = clean_str(item.get("question_text", item.get("text", "")))
-        if not text:
-            continue
-        out.append({
-            "display_index": item.get("display_index", idx + 1),
-            "label": ensure_label(item, idx),
-            "qid": clean_str(item.get("qid", "")),
-            "question_text": text,
-            "knowledge_points": item.get("knowledge_points", []),
-            "chapter": clean_str(item.get("chapter", "")),
-        })
-    return out
-
-
-def get_target_question(row: pd.Series) -> dict[str, Any]:
-    obj = dict_json(row.get("target_question_json", ""))
-    if obj and clean_str(obj.get("question_text")):
-        return obj
-    text = clean_str(row.get("target_question_text", "")) or clean_str(row.get("gt_candidate_text_machine", "")) or clean_str(row.get("gt_candidate_text", "")) or clean_str(row.get("gt_signal", ""))
-    return {"qid": "", "question_text": text}
-
-
-def get_learning_goal(row: pd.Series) -> str:
-    return clean_str(row.get("learning_goal", "")) or (clean_str(row.get("gt_signal", "")) if clean_str(row.get("benchmark", "")) == "Planning_Target" else "")
-
-
-def get_personality_candidates(row: pd.Series) -> list[dict[str, Any]]:
-    entities = list_json(row.get("candidate_entities_json", ""))
-    if not entities:
-        # 极端兜底：不要空白。旧数据下从 candidate_preview 拆，但新数据通常不会走这里。
-        preview = parse_prefixed_preview(row.get("candidate_preview", ""))
-        entities = [
-            {"display_index": i + 1, "label": ensure_label(item, i), "title": f"候选 {ensure_label(item, i)}", "summary": item.get("question_text", ""), "history_items": []}
-            for i, item in enumerate(preview)
-        ]
-    out: list[dict[str, Any]] = []
-    for idx, ent in enumerate(entities):
-        label = ensure_label(ent, idx)
-        out.append({
-            "display_index": ent.get("display_index", idx + 1),
-            "label": label,
-            "entity_id": clean_str(ent.get("entity_id", "")),
-            "entity_type": clean_str(ent.get("entity_type", "")),
-            "title": clean_str(ent.get("title", f"候选 {label}")),
-            "members": ent.get("members", []),
-            "summary": clean_str(ent.get("summary", "")),
-            "history_items": ent.get("history_items", []) if isinstance(ent.get("history_items", []), list) else [],
-        })
-    return out
-
-
-def _find_brace_end(s: str, start: int) -> int:
+def _brace_end(s: str, start: int) -> int:
     depth = 0
     for i in range(start, len(s)):
         if s[i] == "{":
@@ -220,81 +182,132 @@ def _find_brace_end(s: str, start: int) -> int:
     return -1
 
 
-def _replace_one_arg(s: str, cmd: str, renderer) -> str:
+
+def _simple_arg_end(s: str, start: int) -> int:
+    """Return end position for a simple unbraced LaTeX argument such as 2, x, AB, or (x+1).
+
+    This is not a fallback-to-run mechanism; it is part of the renderer grammar because the
+    dataset contains both \sqrt{2} and \sqrt2 / \sqrt 2 style text.
+    """
+    j = start
+    while j < len(s) and s[j].isspace():
+        j += 1
+    if j >= len(s):
+        return j
+    if s[j] in "([|":
+        pairs = {"(": ")", "[": "]", "|": "|"}
+        close = pairs[s[j]]
+        k = j + 1
+        while k < len(s):
+            if s[k] == close:
+                return k + 1
+            k += 1
+        return j + 1
+    if s[j].isalnum() or s[j] in "+-=.°παβγθ":
+        k = j + 1
+        while k < len(s) and (s[k].isalnum() or s[k] in "+-=.°παβγθ"):
+            k += 1
+        return k
+    return j + 1
+
+
+def _one_arg(s: str, cmd: str, renderer) -> str:
+    """Replace LaTeX command with one argument.
+
+    Supports both braced form (\sqrt{2}) and common compact form (\sqrt2).
+    Unknown or incomplete command is preserved as text instead of raising during rendering.
+    Structural validation belongs to the CSV generator; the app renderer should not crash
+    because one historical question contains informal LaTeX.
+    """
     needle = "\\" + cmd
     out: list[str] = []
     i = 0
     while i < len(s):
         if not s.startswith(needle, i):
-            out.append(s[i]); i += 1; continue
+            out.append(s[i])
+            i += 1
+            continue
         j = i + len(needle)
         while j < len(s) and s[j].isspace():
             j += 1
-        if j >= len(s) or s[j] != "{":
-            out.append(s[i]); i += 1; continue
-        end = _find_brace_end(s, j)
-        if end < 0:
-            out.append(s[i]); i += 1; continue
-        out.append(renderer(s[j + 1:end]))
-        i = end + 1
+        if j < len(s) and s[j] == "{":
+            end = _brace_end(s, j)
+            if end >= 0:
+                out.append(renderer(s[j + 1:end]))
+                i = end + 1
+                continue
+        # compact form, e.g. \sqrt2. If there is no usable argument, preserve command.
+        end = _simple_arg_end(s, j)
+        if end > j:
+            out.append(renderer(s[j:end]))
+            i = end
+        else:
+            out.append(needle)
+            i = j
     return "".join(out)
 
 
-def _replace_two_args(s: str, cmd: str, renderer) -> str:
+def _two_args(s: str, cmd: str, renderer) -> str:
+    """Replace LaTeX command with two braced arguments.
+
+    Malformed two-argument commands are preserved so the page remains usable and the
+    problematic text is visible to the annotator instead of crashing the whole app.
+    """
     needle = "\\" + cmd
     out: list[str] = []
     i = 0
     while i < len(s):
         if not s.startswith(needle, i):
-            out.append(s[i]); i += 1; continue
+            out.append(s[i])
+            i += 1
+            continue
         j = i + len(needle)
         while j < len(s) and s[j].isspace():
             j += 1
         if j >= len(s) or s[j] != "{":
-            out.append(s[i]); i += 1; continue
-        end1 = _find_brace_end(s, j)
+            out.append(needle)
+            i = j
+            continue
+        end1 = _brace_end(s, j)
         if end1 < 0:
-            out.append(s[i]); i += 1; continue
+            out.append(s[i:j + 1])
+            i = j + 1
+            continue
         k = end1 + 1
         while k < len(s) and s[k].isspace():
             k += 1
         if k >= len(s) or s[k] != "{":
-            out.append(s[i]); i += 1; continue
-        end2 = _find_brace_end(s, k)
+            out.append(s[i:end1 + 1])
+            i = end1 + 1
+            continue
+        end2 = _brace_end(s, k)
         if end2 < 0:
-            out.append(s[i]); i += 1; continue
+            out.append(s[i:k + 1])
+            i = k + 1
+            continue
         out.append(renderer(s[j + 1:end1], s[k + 1:end2]))
         i = end2 + 1
     return "".join(out)
 
 
-def normalize_latex_text(raw: Any) -> str:
-    s = clean_str(raw)
-    if not s:
-        return ""
-
-    # 删除公式分隔符，但保留内部内容。Planning_Progress 的 $$5$$ 会显示为 5。
+def normalize_latex(raw: Any) -> str:
+    s = clean(raw)
     s = s.replace("\\[", "").replace("\\]", "")
     s = s.replace("\\(", "").replace("\\)", "")
     s = s.replace("$$", "").replace("$", "")
-
-    # cases 环境转成多行可读文本。
     s = re.sub(r"\\begin\{cases\}", "{ ", s)
     s = re.sub(r"\\end\{cases\}", " }", s)
     s = s.replace("&", " ").replace("\\\\", "； ")
 
-    def frac(a: str, b: str) -> str:
-        return f"@@FRAC:{normalize_latex_text(a)}|{normalize_latex_text(b)}@@"
-
-    s = _replace_two_args(s, "dfrac", frac)
-    s = _replace_two_args(s, "frac", frac)
-    s = _replace_one_arg(s, "sqrt", lambda a: f"√({normalize_latex_text(a)})")
+    s = _two_args(s, "dfrac", lambda a, b: f"@@FRAC:{normalize_latex(a)}|{normalize_latex(b)}@@")
+    s = _two_args(s, "frac", lambda a, b: f"@@FRAC:{normalize_latex(a)}|{normalize_latex(b)}@@")
+    s = _one_arg(s, "sqrt", lambda a: f"√({normalize_latex(a)})")
     for cmd in ["text", "mathrm", "rm", "boldsymbol"]:
-        s = _replace_one_arg(s, cmd, normalize_latex_text)
-    s = _replace_one_arg(s, "overline", lambda a: f"{normalize_latex_text(a)}̅")
-    s = _replace_one_arg(s, "overparen", lambda a: f"⌒{normalize_latex_text(a)}")
+        s = _one_arg(s, cmd, normalize_latex)
+    s = _one_arg(s, "overline", lambda a: f"{normalize_latex(a)}̅")
+    s = _one_arg(s, "overparen", lambda a: f"⌒{normalize_latex(a)}")
 
-    repl = {
+    replacements = {
         r"\vartriangle": "△", r"\triangle": "△", r"\angle": "∠",
         r"\bot": "⊥", r"\perp": "⊥", r"\parallel": "∥", r"/\!/": "∥",
         r"\times": "×", r"\cdot": "·", r"\div": "÷", r"\circ": "°",
@@ -304,41 +317,35 @@ def normalize_latex_text(raw: Any) -> str:
         r"\sim": "∼", r"\infty": "∞", r"\cdots": "⋯", r"\dots": "…", r"\odot": "⊙",
         r"\#": "#",
     }
-    for old, new in repl.items():
+    for old, new in replacements.items():
         s = s.replace(old, new)
-
     s = re.sub(r"\{\s*\^\s*°\s*\}", "°", s)
     s = re.sub(r"\^\s*\{\s*°\s*\}", "°", s)
 
     def sup(m: re.Match) -> str:
-        body = normalize_latex_text(m.group(1) or m.group(2))
-        if re.fullmatch(r"[0-9+\-=()nix]+", body):
-            return body.translate(SUP)
-        return f"@@SUP:{body}@@"
+        body = normalize_latex(m.group(1) or m.group(2))
+        return body.translate(SUP) if re.fullmatch(r"[0-9+\-=()nix]+", body) else f"@@SUP:{body}@@"
 
     def sub(m: re.Match) -> str:
-        body = normalize_latex_text(m.group(1) or m.group(2))
-        if re.fullmatch(r"[0-9+\-=()nix]+", body):
-            return body.translate(SUB)
-        return f"@@SUB:{body}@@"
+        body = normalize_latex(m.group(1) or m.group(2))
+        return body.translate(SUB) if re.fullmatch(r"[0-9+\-=()nix]+", body) else f"@@SUB:{body}@@"
 
-    s = re.sub(r"\^\{([^{}]{1,60})\}|\^([A-Za-z0-9+\-=()])", sup, s)
-    s = re.sub(r"_\{([^{}]{1,60})\}|_([A-Za-z0-9+\-=()])", sub, s)
-    s = re.sub(r"\{([A-Za-z0-9+\-*/=<>≤≥.,，。:：_()（）\[\]αβγθπ°| ]{1,80})\}", r"\1", s)
+    s = re.sub(r"\^\{([^{}]{1,80})\}|\^([A-Za-z0-9+\-=()])", sup, s)
+    s = re.sub(r"_\{([^{}]{1,80})\}|_([A-Za-z0-9+\-=()])", sub, s)
+    s = re.sub(r"\{([A-Za-z0-9+\-*/=<>≤≥.,，。:：_()（）\[\]αβγθπ°| ]{1,100})\}", r"\1", s)
     s = re.sub(r"\\([A-Za-z]+)", r"\1", s)
-    s = s.replace("{", "").replace("}", "")
-    return s
+    return s.replace("{", "").replace("}", "")
 
 
-def render_text_html(raw: Any) -> str:
-    s = normalize_latex_text(raw).replace("\r\n", "\n").replace("\r", "\n")
+def qhtml(raw: Any) -> str:
+    s = normalize_latex(raw).replace("\r\n", "\n").replace("\r", "\n")
     protected: dict[str, str] = {}
 
-    def protect(pattern: str, repl_func) -> None:
+    def protect(pattern: str, renderer) -> None:
         nonlocal s
         def repl(m: re.Match) -> str:
             token = f"@@HTML{len(protected)}@@"
-            protected[token] = repl_func(m)
+            protected[token] = renderer(m)
             return token
         s = re.sub(pattern, repl, s, flags=re.S)
 
@@ -348,229 +355,350 @@ def render_text_html(raw: Any) -> str:
     out = html.escape(s, quote=False).replace("\n", "<br>")
     for token, value in protected.items():
         out = out.replace(token, value)
-    out = re.sub(r"(?<![A-Za-z])([ABCD])\.", r"<span class='choice'>\1.</span>", out)
-    return out
+    return re.sub(r"(?<![A-Za-z])([ABCD])\.", r"<span class='choice'>\1.</span>", out)
 
 
-def css() -> None:
-    st.markdown(
-        """
-        <style>
-        .block-container {max-width: 1500px; padding-top: 1.2rem; padding-bottom: 2rem;}
-        div[data-testid="stVerticalBlock"] {gap: .65rem;}
-        .top-caption {color:#64748b; font-size:.92rem;}
-        .task-card,.goal-card,.target-card,.section-card,.candidate-card,.entity-card {
-            border:1px solid #e5e7eb; border-radius:18px; padding:14px 16px; background:#fff;
-            box-shadow:0 1px 2px rgba(15,23,42,.045); margin:.55rem 0;
-        }
-        .task-card {background:linear-gradient(180deg,#eff6ff 0%,#ffffff 90%); border-color:#bfdbfe;}
-        .goal-card {background:#fffbeb; border-color:#f59e0b; border-left:7px solid #f59e0b;}
-        .target-card {background:#f0fdf4; border-color:#22c55e; border-left:7px solid #22c55e;}
-        .section-title {font-weight:900; font-size:1.12rem; margin:1.1rem 0 .35rem; display:flex; align-items:center; gap:.45rem;}
-        .section-title:before {content:""; display:inline-block; width:5px; height:18px; border-radius:999px; background:#2563eb;}
-        .candidate-card {border-left:7px solid #2563eb;}
-        .entity-card {border-left:7px solid #7c3aed;}
-        .history-card {border-left:6px solid #94a3b8;}
-        .card-head {display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:8px;}
-        .card-title {font-weight:900; color:#0f172a;}
-        .meta {font-size:.82rem; color:#64748b; background:#f1f5f9; padding:3px 9px; border-radius:999px; white-space:nowrap;}
-        .badge {display:inline-flex; align-items:center; justify-content:center; min-width:28px; height:28px; padding:0 8px; margin-right:8px; border-radius:999px; background:#2563eb; color:white; font-weight:900;}
-        .entity-card .badge {background:#7c3aed;}
-        .qtext {font-size:1.02rem; line-height:1.85; word-break:break-word; overflow-wrap:anywhere;}
-        .smalltext {font-size:.95rem; line-height:1.7; color:#334155;}
-        .frac {display:inline-grid; grid-template-rows:auto auto; align-items:center; justify-items:center; vertical-align:middle; margin:0 .14em; line-height:1.05;}
-        .frac .num {border-bottom:1.4px solid currentColor; padding:0 .22em .08em;}
-        .frac .den {padding:.08em .22em 0;}
-        sup, sub {font-size:.72em; line-height:0;}
-        .choice {display:inline-block; margin-left:.45em; margin-right:.08em; padding:0 .28em; border-radius:6px; background:#eef2ff; color:#3730a3; font-weight:800;}
-        .history-grid {display:grid; gap:8px;}
-        .member {font-size:.88rem; color:#475569; margin:.25rem 0 .1rem; font-weight:800;}
-        .sticky-box {position: sticky; top: 1rem;}
-        .stRadio [role="radiogroup"] {gap:.35rem .65rem;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+def short_hint(text: Any, n: int = 72) -> str:
+    plain = re.sub(r"<[^>]+>", "", qhtml(text))
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain if len(plain) <= n else plain[:n] + "…"
+
+
+def score_text(item: dict[str, Any]) -> str:
+    score = clean(item.get("score"))
+    total = clean(item.get("total"))
+    if score and total:
+        return f"{score}/{total}"
+    if score:
+        return score
+    return "—"
+
+
+def score_class(item: dict[str, Any]) -> str:
+    score = clean(item.get("score"))
+    total = clean(item.get("total"))
+    if not score or not total:
+        return " score-empty"
+    s = float(score)
+    t = float(total)
+    if t > 0 and s >= t:
+        return " score-full"
+    if s == 0:
+        return " score-zero"
+    return " score-partial"
+
+
+def history_key(item: dict[str, Any]) -> tuple[str, str]:
+    return clean(item.get("qid")), clean(item.get("index"))
+
+
+def collect_questions(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    for ent in entities:
+        for item in ent["history_items"]:
+            key = history_key(item)
+            if key not in seen:
+                seen[key] = item
+    def sort_key(x: dict[str, Any]) -> tuple[int, str]:
+        idx = clean(x.get("index"))
+        return (int(idx) if idx.isdigit() else 9999, clean(x.get("qid")))
+    return sorted(seen.values(), key=sort_key)
 
 
 def html_block(markup: str) -> None:
     st.markdown(markup, unsafe_allow_html=True)
 
 
-def card(title: str, text: Any, *, meta: str = "", kind: str = "section-card", badge: str = "") -> None:
+def inject_css() -> None:
+    html_block("""
+    <style>
+    .block-container {max-width: 1500px; padding-top: 1.2rem; padding-bottom: 2rem;}
+    div[data-testid="stVerticalBlock"] {gap: .62rem;}
+    .task-card,.goal-card,.target-card,.section-card,.candidate-card,.entity-card {border:1px solid #e5e7eb; border-radius:18px; padding:14px 16px; background:#fff; box-shadow:0 1px 2px rgba(15,23,42,.045); margin:.55rem 0;}
+    .task-card {background:linear-gradient(180deg,#eff6ff 0%,#fff 90%); border-color:#bfdbfe;}
+    .goal-card {background:#fffbeb; border-color:#f59e0b; border-left:7px solid #f59e0b;}
+    .target-card {background:#f0fdf4; border-color:#22c55e; border-left:7px solid #22c55e;}
+    .history-card {border-left:6px solid #94a3b8;}
+    .candidate-card {border-left:7px solid #2563eb;}
+    .entity-card {border-left:7px solid #7c3aed;}
+    .section-title {font-weight:900; font-size:1.12rem; margin:1.05rem 0 .35rem; display:flex; align-items:center; gap:.45rem;}
+    .section-title:before {content:""; display:inline-block; width:5px; height:18px; border-radius:999px; background:#2563eb;}
+    .card-head {display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:8px;}
+    .card-title {font-weight:900; color:#0f172a;}
+    .meta {font-size:.82rem; color:#64748b; background:#f1f5f9; padding:3px 9px; border-radius:999px; white-space:nowrap;}
+    .badge {display:inline-flex; align-items:center; justify-content:center; min-width:28px; height:28px; padding:0 8px; margin-right:8px; border-radius:999px; background:#2563eb; color:white; font-weight:900;}
+    .entity-card .badge {background:#7c3aed;}
+    .qtext {font-size:1.02rem; line-height:1.85; word-break:break-word; overflow-wrap:anywhere;}
+    .smalltext {font-size:.95rem; line-height:1.72; color:#334155;}
+    .frac {display:inline-grid; grid-template-rows:auto auto; align-items:center; justify-items:center; vertical-align:middle; margin:0 .14em; line-height:1.05;}
+    .frac .num {border-bottom:1.4px solid currentColor; padding:0 .22em .08em;}
+    .frac .den {padding:.08em .22em 0;}
+    .choice {display:inline-block; margin-left:.5em; margin-right:.12em; padding:0 .28em; border-radius:6px; background:#eef2ff; color:#3730a3; font-weight:900;}
+    .score-table {width:100%; border-collapse:separate; border-spacing:0; margin-top:10px; font-size:.92rem; overflow:hidden; border:1px solid #e5e7eb; border-radius:14px;}
+    .score-table th {background:#f8fafc; color:#334155; font-weight:800; text-align:left; padding:8px 10px; border-bottom:1px solid #e5e7eb;}
+    .score-table td {padding:8px 10px; border-bottom:1px solid #eef2f7; vertical-align:top;}
+    .score-table tr:last-child td {border-bottom:0;}
+    .qnum {font-weight:900; color:#1d4ed8; white-space:nowrap;}
+    .qhint {color:#0f172a; min-width:280px;}
+    .score-chip {display:inline-block; min-width:46px; text-align:center; border-radius:999px; padding:2px 8px; font-weight:850; background:#f1f5f9; color:#334155;}
+    .score-full {background:#dcfce7; color:#166534;}
+    .score-zero {background:#fee2e2; color:#991b1b;}
+    .score-partial {background:#fef3c7; color:#92400e;}
+    .score-empty {background:#f1f5f9; color:#64748b;}
+    .member-total {display:inline-block; margin:4px 6px 4px 0; padding:3px 9px; border-radius:999px; background:#f5f3ff; color:#5b21b6; font-weight:800; font-size:.88rem;}
+    </style>
+    """)
+
+
+def card(title: str, body: Any, meta: str = "", kind: str = "section-card", badge: str = "") -> None:
     badge_html = f"<span class='badge'>{html.escape(badge)}</span>" if badge else ""
     meta_html = f"<span class='meta'>{html.escape(meta)}</span>" if meta else ""
-    html_block(f"""
-    <div class='{kind}'>
-      <div class='card-head'><div class='card-title'>{badge_html}{html.escape(title)}</div>{meta_html}</div>
-      <div class='qtext'>{render_text_html(text)}</div>
-    </div>
-    """)
+    html_block(
+        f"<div class='{kind}'>"
+        f"<div class='card-head'><div class='card-title'>{badge_html}{html.escape(title)}</div>{meta_html}</div>"
+        f"<div class='qtext'>{qhtml(body)}</div>"
+        "</div>"
+    )
 
 
-def render_task_guidance(row: pd.Series) -> None:
-    benchmark = clean_str(row.get("benchmark", ""))
-    label = clean_str(row.get("task_label", "")) or TASK_LABELS.get(benchmark, benchmark)
-    guide = TASK_GUIDANCE.get(benchmark, {"goal": "请根据页面信息选择最合理的推荐对象。", "basis": []})
-    basis = "".join(f"<li>{html.escape(x)}</li>" for x in guide.get("basis", []))
-    focus = clean_str(row.get("teacher_check_focus", ""))
+def render_task(row: pd.Series) -> None:
+    benchmark = clean(row["benchmark"])
+    info = TASK_GUIDANCE[benchmark]
+    bullets = "".join(f"<li>{html.escape(x)}</li>" for x in info["basis"])
+    focus = clean(row["teacher_check_focus"])
     focus_html = f"<div class='smalltext'><b>检查重点：</b>{html.escape(focus)}</div>" if focus else ""
-    html_block(f"""
-    <div class='task-card'>
-      <div class='card-title'>{html.escape(label)}</div>
-      <div class='smalltext'><b>任务：</b>{html.escape(guide.get('goal', ''))}</div>
-      <ul class='smalltext' style='margin:.35rem 0 0 1.1rem;'>{basis}</ul>
-      {focus_html}
-    </div>
-    """)
+    html_block(
+        "<div class='task-card'>"
+        f"<div class='card-title'>{html.escape(TASK_LABELS[benchmark])}</div>"
+        f"<div class='smalltext'><b>任务：</b>{html.escape(info['goal'])}</div>"
+        f"<ul class='smalltext'>{bullets}</ul>"
+        f"{focus_html}"
+        "</div>"
+    )
 
 
-def score_meta(item: dict[str, Any]) -> str:
-    score, total = clean_str(item.get("score", "")), clean_str(item.get("total", ""))
-    qid = clean_str(item.get("qid", ""))
-    parts = []
-    if score or total:
-        parts.append(f"得分 {score}/{total}" if total else f"得分 {score}")
-    if qid:
-        parts.append(qid)
-    return " · ".join(parts)
+def render_history_score_table(items: list[dict[str, Any]], title: str = "学生历史作答记录") -> None:
+    """Compact score view for tasks where correctness/progress matters.
 
-
-def render_history(items: list[dict[str, Any]], title: str = "学生历史 / 学习轨迹") -> None:
+    Each row carries Q号 + qid + short question hint + score, matching the
+    Personality task style so annotators do not need to map dry Q numbers
+    back to a separate question list.
+    """
     html_block(f"<div class='section-title'>{html.escape(title)}</div>")
-    if not items:
-        st.info("没有可展示的历史信息。")
-        return
-    for idx, item in enumerate(items, start=1):
-        label = clean_str(item.get("index", "")) or str(idx)
-        text = item.get("question_text", item.get("text", ""))
-        member = clean_str(item.get("member_label", ""))
-        prefix = f"成员 {member} · " if member else ""
-        card(f"{prefix}历史 {label}", text, meta=score_meta(item), kind="section-card history-card")
+    rows: list[str] = []
+    for i, item in enumerate(items, start=1):
+        idx = clean(item.get("index")) or str(i)
+        qid = clean(item.get("qid"))
+        rows.append(
+            "<tr>"
+            f"<td class='qnum'>Q{html.escape(idx)}</td>"
+            f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>"
+            f"<td class='qhint'>{html.escape(short_hint(item.get('question_text', ''), 96))}</td>"
+            f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>"
+            "</tr>"
+        )
+    html_block(
+        "<table class='score-table'>"
+        "<thead><tr><th>题号</th><th>qid</th><th>题目提示</th><th>得分</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
 
 
-def render_question_candidates(candidates: list[dict[str, Any]], title: str = "候选题") -> None:
+def render_history_questions(items: list[dict[str, Any]], title: str, show_score: bool) -> None:
     html_block(f"<div class='section-title'>{html.escape(title)}</div>")
-    if not candidates:
-        st.error("当前样本没有候选题。请检查 candidate_items_json。")
+    for i, item in enumerate(items, start=1):
+        idx = clean(item.get("index")) or str(i)
+        qid = clean(item.get("qid"))
+        meta_parts = [qid]
+        if show_score:
+            meta_parts.append(score_text(item))
+        meta = " · ".join(x for x in meta_parts if x and x != "—")
+        card(f"历史题 Q{idx}", item["question_text"], meta=meta, kind="section-card history-card")
+
+
+def render_question_history(items: list[dict[str, Any]], benchmark: str) -> None:
+    if benchmark == "KP_Stage":
+        render_history_questions(items, "学生历史题目", show_score=False)
         return
-    for item in candidates:
-        label = clean_str(item.get("label", ""))
-        qid = clean_str(item.get("qid", ""))
-        kp = item.get("knowledge_points", [])
-        kp_text = "、".join(map(str, kp)) if isinstance(kp, list) and kp else ""
-        meta = " · ".join(x for x in [qid, kp_text] if x)
-        card(f"候选 {label}", item.get("question_text", ""), meta=meta, kind="candidate-card", badge=label)
+
+    if benchmark == "Planning_Progress":
+        render_history_score_table(items, "学生最近学习轨迹 / 得分记录")
+        render_history_questions(items, "完整历史题目", show_score=True)
+        return
+
+    render_history_score_table(items, "学生历史作答记录")
+    render_history_questions(items, "完整历史题目", show_score=True)
+
+
+def render_question_candidates(items: list[dict[str, Any]]) -> None:
+    html_block("<div class='section-title'>候选题</div>")
+    for i, item in enumerate(items):
+        label = clean(item["label"])
+        qid = clean(item.get("qid"))
+        card(f"候选 {label}", item["question_text"], meta=qid, kind="candidate-card", badge=label)
+
+
+def render_full_history_questions(entities: list[dict[str, Any]]) -> None:
+    html_block("<div class='section-title'>完整历史题目</div>")
+    html_block("<div class='section-card'><div class='smalltext'><b>阅读方式：</b>先完整看一遍历史题，形成题型印象；随后每个候选学生 / 学生组的作答记录表里会把 Q号、qid、题目提示和得分放在同一行。</div></div>")
+    for item in collect_questions(entities):
+        idx = clean(item.get("index"))
+        qid = clean(item.get("qid"))
+        card(f"历史题 Q{idx}", item["question_text"], meta=qid, kind="section-card history-card")
+
+
+def group_items_by_member(items: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        member = clean(item.get("member_label")) or clean(item.get("member_id")) or "学生"
+        grouped.setdefault(member, []).append(item)
+    return grouped
+
+
+def member_total(items: list[dict[str, Any]]) -> str:
+    score = 0.0
+    total = 0.0
+    seen_score = False
+    for item in items:
+        s = clean(item.get("score"))
+        t = clean(item.get("total"))
+        if s:
+            score += float(s)
+            seen_score = True
+        if t:
+            total += float(t)
+    if not seen_score:
+        return "—"
+    return f"{score:g}/{total:g}" if total else f"{score:g}"
+
+
+def individual_table(entity: dict[str, Any]) -> str:
+    rows = []
+    for i, item in enumerate(entity["history_items"], start=1):
+        idx = clean(item.get("index")) or str(i)
+        qid = clean(item.get("qid"))
+        rows.append(
+            "<tr>"
+            f"<td class='qnum'>Q{html.escape(idx)}</td>"
+            f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>"
+            f"<td class='qhint'>{html.escape(short_hint(item['question_text'], 90))}</td>"
+            f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>"
+            "</tr>"
+        )
+    return "<table class='score-table'><thead><tr><th>题号</th><th>qid</th><th>题目提示</th><th>得分</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+
+
+def group_table(entity: dict[str, Any]) -> str:
+    grouped = group_items_by_member(entity["history_items"])
+    members = [clean(x) for x in entity.get("members", []) if clean(x)] or sorted(grouped)
+    questions = collect_questions([entity])
+    lookup = {(member, history_key(item)): item for member, items in grouped.items() for item in items}
+    head = "<tr><th>题号</th><th>qid</th><th>题目提示</th>" + "".join(f"<th>成员 {html.escape(m)}</th>" for m in members) + "</tr>"
+    rows = []
+    for i, q in enumerate(questions, start=1):
+        idx = clean(q.get("index")) or str(i)
+        qid = clean(q.get("qid"))
+        cells = [
+            f"<td class='qnum'>Q{html.escape(idx)}</td>",
+            f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>",
+            f"<td class='qhint'>{html.escape(short_hint(q['question_text'], 82))}</td>",
+        ]
+        for member in members:
+            item = lookup.get((member, history_key(q)), {})
+            cells.append(f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>")
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    return "<table class='score-table'><thead>" + head + "</thead><tbody>" + "".join(rows) + "</tbody></table>"
 
 
 def render_entity_candidates(entities: list[dict[str, Any]], benchmark: str) -> None:
-    title = "候选学生组" if benchmark == "Personality_Group" else "候选学生"
-    html_block(f"<div class='section-title'>{title}</div>")
-    if not entities:
-        st.error("当前样本没有候选实体。请检查 candidate_entities_json。")
-        return
-    for ent in entities:
-        label = ent["label"]
-        members = ent.get("members", [])
-        members_text = "成员：" + "、".join(map(str, members)) if members else ""
-        entity_id = clean_str(ent.get("entity_id", ""))
-        meta = " · ".join(x for x in [entity_id, members_text] if x)
-        summary = ent.get("summary", "")
-        html_block(f"""
-        <div class='entity-card'>
-          <div class='card-head'><div class='card-title'><span class='badge'>{html.escape(label)}</span>{html.escape(ent.get('title') or f'候选 {label}')}</div><span class='meta'>{html.escape(meta)}</span></div>
-          {f"<div class='smalltext'>{render_text_html(summary)}</div>" if summary else ""}
-        """)
-        histories = ent.get("history_items", [])
-        if histories:
-            # 直接在卡片内列前 10 条，完整但不至于爆炸；这份数据每候选通常 10 条。
-            for i, item in enumerate(histories, start=1):
-                idx = clean_str(item.get("index", "")) or str(i)
-                member = clean_str(item.get("member_label", ""))
-                member_html = f"<div class='member'>成员 {html.escape(member)}</div>" if member else ""
-                html_block(f"""
-                    {member_html}
-                    <div class='section-card history-card' style='margin:.42rem 0; padding:10px 12px;'>
-                      <div class='card-head'><div class='card-title'>历史 {html.escape(idx)}</div><span class='meta'>{html.escape(score_meta(item))}</span></div>
-                      <div class='qtext'>{render_text_html(item.get('question_text', ''))}</div>
-                    </div>
-                """)
-        html_block("</div>")
+    html_block(f"<div class='section-title'>{'候选学生组' if benchmark == 'Personality_Group' else '候选学生'}</div>")
+    for entity in entities:
+        label = clean(entity["label"])
+        entity_id = clean(entity.get("entity_id"))
+        if benchmark == "Personality_Group":
+            grouped = group_items_by_member(entity["history_items"])
+            members = [clean(x) for x in entity.get("members", []) if clean(x)] or sorted(grouped)
+            totals = "".join(f"<span class='member-total'>成员 {html.escape(m)}：{html.escape(member_total(grouped.get(m, [])))}</span>" for m in members)
+            table = group_table(entity)
+            meta = " · ".join(x for x in [entity_id, "成员：" + "、".join(members)] if x)
+        else:
+            totals = f"<span class='member-total'>总分：{html.escape(member_total(entity['history_items']))}</span>"
+            table = individual_table(entity)
+            meta = entity_id
+        html_block(
+            "<div class='entity-card'>"
+            f"<div class='card-head'><div class='card-title'><span class='badge'>{html.escape(label)}</span>{html.escape(entity['title'])}</div><span class='meta'>{html.escape(meta)}</span></div>"
+            f"<div>{totals}</div>"
+            f"{table}"
+            "</div>"
+        )
 
 
 def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
-    benchmark = clean_str(row.get("benchmark", ""))
-    render_task_guidance(row)
+    benchmark = clean(row["benchmark"])
+    row_id = clean(row["row_id"])
+    render_task(row)
 
     if benchmark == "Planning_Target":
-        goal = get_learning_goal(row)
-        card("显式学习目标", goal or "（缺失）", kind="goal-card")
-    elif benchmark == "Planning_Progress":
-        state = clean_str(row.get("progress_state", "")) or clean_str(row.get("gt_signal", ""))
-        if state:
-            card("学习进程状态", state, kind="goal-card")
-    elif benchmark == "KP_Weak":
-        weak = clean_str(row.get("weak_knowledge_points", "")) or clean_str(row.get("gt_signal", ""))
-        if weak:
-            card("薄弱知识点", weak, kind="goal-card")
-    elif benchmark == "KP_Stage":
-        stage = clean_str(row.get("stage_knowledge_points", "")) or clean_str(row.get("gt_signal", ""))
-        if stage:
-            card("当前知识阶段 / 章节", stage, kind="goal-card")
+        card("显式学习目标", row["learning_goal"], kind="goal-card")
+    if benchmark == "Planning_Progress":
+        card("学习进程状态", row["progress_state"], kind="goal-card")
+    if benchmark == "KP_Weak" and clean(row["weak_knowledge_points"]):
+        card("薄弱知识点", row["weak_knowledge_points"], kind="goal-card")
+    if benchmark == "KP_Stage" and clean(row["stage_knowledge_points"]):
+        card("当前知识阶段 / 章节", row["stage_knowledge_points"], kind="goal-card")
 
-    if benchmark in {"Personality_Individual", "Personality_Group"}:
-        target = get_target_question(row)
-        card("目标题目", target.get("question_text", "（缺失）"), meta=clean_str(target.get("qid", "")), kind="target-card")
-        entities = get_personality_candidates(row)
-        render_entity_candidates(entities, benchmark)
-        return entities, "entity"
+    if benchmark in QUESTION_TASKS:
+        history = json_list(row["history_items_json"], "history_items_json", row_id)
+        candidates = json_list(row["candidate_items_json"], "candidate_items_json", row_id)
+        render_question_history(history, benchmark)
+        render_question_candidates(candidates)
+        return candidates, "question"
 
-    history = get_history_items(row)
-    render_history(history, "学生历史作答 / 学习轨迹")
-    candidates = get_question_candidates(row)
-    render_question_candidates(candidates, "候选下一步练习题" if benchmark.startswith("Planning") else "候选题")
-    return candidates, "question"
+    target = json_dict(row["target_question_json"], "target_question_json", row_id)
+    entities = json_list(row["candidate_entities_json"], "candidate_entities_json", row_id)
+    card("目标题目", target["question_text"], meta=clean(target.get("qid")), kind="target-card")
+    render_full_history_questions(entities)
+    render_entity_candidates(entities, benchmark)
+    return entities, "entity"
 
 
 def init_state(df: pd.DataFrame) -> None:
     st.session_state.setdefault("annotations", {})
     st.session_state.setdefault("current_index", 0)
-    valid = set(map(int, df["row_id"].tolist()))
-    st.session_state.annotations = {int(k): v for k, v in st.session_state.annotations.items() if int(k) in valid}
+    valid = set(df["row_id"].astype(str))
+    st.session_state.annotations = {str(k): v for k, v in st.session_state.annotations.items() if str(k) in valid}
 
 
 def default_annotation() -> dict[str, Any]:
     return {"teacher_choice_label": "", "teacher_choice_text": "", "teacher_confidence": 3, "teacher_reason": "", "teacher_comment": ""}
 
 
-def render_annotation_form(row: pd.Series, choices: list[dict[str, Any]], choice_type: str) -> None:
-    row_id = int(row["row_id"])
+def render_form(row: pd.Series, choices: list[dict[str, Any]], choice_type: str) -> None:
+    row_id = clean(row["row_id"])
     current = {**default_annotation(), **st.session_state.annotations.get(row_id, {})}
-    labels = [clean_str(x.get("label", "")) for x in choices if clean_str(x.get("label", ""))]
+    labels = [clean(x["label"]) for x in choices]
     options = [""] + labels + ["无法判断 / 暂不推荐"]
-    label_to_text = {}
-    for x in choices:
-        label = clean_str(x.get("label", ""))
-        if choice_type == "entity":
-            label_to_text[label] = clean_str(x.get("title", "")) or clean_str(x.get("summary", "")) or label
-        else:
-            label_to_text[label] = clean_str(x.get("question_text", ""))
+    label_to_text = {
+        clean(x["label"]): clean(x["title"]) if choice_type == "entity" else clean(x["question_text"])
+        for x in choices
+    }
 
-    html_block("<div class='sticky-box'>")
     st.subheader("教师标注")
     choice = st.radio(
         "请选择你会推荐的候选项",
         options=options,
-        index=options.index(current.get("teacher_choice_label", "")) if current.get("teacher_choice_label", "") in options else 0,
+        index=options.index(current["teacher_choice_label"]) if current["teacher_choice_label"] in options else 0,
         format_func=lambda x: "请选择" if x == "" else x,
         horizontal=True,
     )
     if choice in label_to_text:
         st.markdown(f"**已选：{choice}**")
-        st.markdown(f"<div class='section-card'><div class='qtext'>{render_text_html(label_to_text[choice])}</div></div>", unsafe_allow_html=True)
-    confidence = st.slider("推荐把握度", 1, 5, int(current.get("teacher_confidence", 3)))
-    reason = st.text_area("推荐理由", value=clean_str(current.get("teacher_reason", "")), height=160, placeholder="请说明为什么推荐这个候选。")
-    comment = st.text_area("补充备注", value=clean_str(current.get("teacher_comment", "")), height=110, placeholder="记录歧义、样本问题或其他备选意见。")
+        st.markdown(f"<div class='section-card'><div class='qtext'>{qhtml(label_to_text[choice])}</div></div>", unsafe_allow_html=True)
+    confidence = st.slider("推荐把握度", 1, 5, int(current["teacher_confidence"]))
+    reason = st.text_area("推荐理由", value=clean(current["teacher_reason"]), height=135, placeholder="请说明为什么推荐这个候选。")
+    comment = st.text_area("补充备注", value=clean(current["teacher_comment"]), height=115, placeholder="可记录歧义、样本问题、其他备选意见。")
+
     st.session_state.annotations[row_id] = {
         "teacher_choice_label": choice,
         "teacher_choice_text": label_to_text.get(choice, choice),
@@ -578,15 +706,13 @@ def render_annotation_form(row: pd.Series, choices: list[dict[str, Any]], choice
         "teacher_reason": reason,
         "teacher_comment": comment,
     }
-    html_block("</div>")
 
 
 def build_export_df(df: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    by_id = df.set_index("row_id").to_dict(orient="index")
-    for row_id, ann in sorted(st.session_state.annotations.items()):
-        base = by_id.get(row_id, {})
-        rows.append({"row_id": row_id, **base, **ann, "saved_at": datetime.now().isoformat(timespec="seconds")})
+    base = df.set_index("row_id", drop=False).to_dict(orient="index")
+    rows = []
+    for row_id, annotation in st.session_state.annotations.items():
+        rows.append({**base[row_id], **annotation, "saved_at": datetime.now().isoformat(timespec="seconds")})
     return pd.DataFrame(rows)
 
 
@@ -597,61 +723,58 @@ def save_local(export_df: pd.DataFrame) -> Path:
     return path
 
 
-def sidebar_filter(df: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.header("筛选")
-    options = ["全部"] + [TASK_LABELS.get(b, b) for b in sorted(df["benchmark"].dropna().unique())]
-    selected = st.sidebar.selectbox("任务维度", options)
-    if selected == "全部":
-        out = df.copy()
-    else:
-        reverse = {TASK_LABELS.get(b, b): b for b in df["benchmark"].dropna().unique()}
-        out = df[df["benchmark"] == reverse[selected]].copy()
-    return out.reset_index(drop=True)
-
-
 def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
-    css()
+    inject_css()
     st.title("教师推荐标注")
-    st.markdown("<div class='top-caption'>按任务语义展示：学习目标、学习进程、目标题目、候选学生 / 组会分开呈现；页面不展示 GT 或 is_gt。</div>", unsafe_allow_html=True)
+st.caption(f"版本：{APP_VERSION}")
+    st.caption("严格版：只读取规范 review_samples.csv；缺字段或字段语义错误会直接报错，不做兼容兜底。")
 
     df = load_samples()
     init_state(df)
-    filtered = sidebar_filter(df)
-    if filtered.empty:
-        st.warning("当前筛选下没有样本。")
-        return
 
-    annotated = sum(1 for rid in filtered["row_id"].tolist() if st.session_state.annotations.get(int(rid), {}).get("teacher_choice_label"))
-    st.sidebar.metric("当前筛选已标注", f"{annotated}/{len(filtered)}")
+    st.sidebar.header("筛选")
+    dims = ["全部"] + [TASK_LABELS[x] for x in sorted(df["benchmark"].unique())]
+    selected = st.sidebar.selectbox("维度", dims)
+    if selected == "全部":
+        filtered = df.reset_index(drop=True)
+    else:
+        rev = {TASK_LABELS[k]: k for k in TASK_LABELS}
+        filtered = df[df["benchmark"] == rev[selected]].reset_index(drop=True)
+
+    require(len(filtered) > 0, "当前筛选下没有样本")
     if st.session_state.current_index >= len(filtered):
         st.session_state.current_index = 0
 
-    row_ids = filtered["row_id"].tolist()
+    annotated = sum(1 for rid in filtered["row_id"].astype(str) if st.session_state.annotations.get(rid, {}).get("teacher_choice_label"))
+    st.sidebar.metric("当前筛选下已标注", f"{annotated}/{len(filtered)}")
+
+    row_ids = filtered["row_id"].astype(str).tolist()
     selected_row_id = st.sidebar.selectbox(
         "跳转到样本",
         row_ids,
-        index=min(st.session_state.current_index, len(row_ids) - 1),
-        format_func=lambda rid: f"{rid} | {TASK_LABELS.get(filtered[filtered['row_id'] == rid].iloc[0]['benchmark'], filtered[filtered['row_id'] == rid].iloc[0]['benchmark'])}",
+        index=st.session_state.current_index,
+        format_func=lambda rid: f"{rid} | {TASK_LABELS[clean(filtered[filtered['row_id'].astype(str) == rid].iloc[0]['benchmark'])]}",
     )
-    st.session_state.current_index = int(filtered.index[filtered["row_id"] == selected_row_id][0])
+    st.session_state.current_index = row_ids.index(selected_row_id)
 
-    nav1, nav2, nav3 = st.columns([1, 1, 5])
-    if nav1.button("上一条", use_container_width=True) and st.session_state.current_index > 0:
+    c1, c2, c3 = st.columns([1, 1, 4])
+    if c1.button("上一条", use_container_width=True) and st.session_state.current_index > 0:
         st.session_state.current_index -= 1
         st.rerun()
-    if nav2.button("下一条", use_container_width=True) and st.session_state.current_index < len(filtered) - 1:
+    if c2.button("下一条", use_container_width=True) and st.session_state.current_index < len(filtered) - 1:
         st.session_state.current_index += 1
         st.rerun()
-    nav3.progress((st.session_state.current_index + 1) / len(filtered))
-    st.caption(f"样本 {st.session_state.current_index + 1} / {len(filtered)}")
+    c3.progress((st.session_state.current_index + 1) / len(filtered))
 
     row = filtered.iloc[st.session_state.current_index]
-    left, right = st.columns([1.58, 1.0], gap="large")
+    st.caption(f"样本 {st.session_state.current_index + 1} / {len(filtered)} · row_id={clean(row['row_id'])} · sample_id={clean(row['sample_id'])}")
+
+    left, right = st.columns([1.62, 1], gap="large")
     with left:
         choices, choice_type = render_left(row)
     with right:
-        render_annotation_form(row, choices, choice_type)
+        render_form(row, choices, choice_type)
 
     st.divider()
     export_df = build_export_df(df)
@@ -662,9 +785,8 @@ def main() -> None:
         data=export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
         file_name="teacher_recommendation_annotations.csv",
         mime="text/csv",
-        use_container_width=True,
     )
-    if st.button("保存到本地 data/annotations", use_container_width=True):
+    if st.button("保存到本地文件"):
         path = save_local(export_df)
         st.success(f"已保存到 {path}")
     with st.expander("当前会话标注预览", expanded=False):
