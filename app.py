@@ -731,6 +731,65 @@ def save_local(export_df: pd.DataFrame) -> Path:
     return path
 
 
+def score_text(item: dict[str, Any]) -> str:
+    score = clean(item.get("score"))
+    total = clean(item.get("total"))
+    response = clean(item.get("response"))
+    if (not score and not total) and response:
+        if response == "correct":
+            score, total = "1", "1"
+        elif response == "incorrect":
+            score, total = "0", "1"
+    if score and total:
+        return f"{score}/{total}"
+    if score:
+        return score
+    return "-"
+
+
+def score_class(item: dict[str, Any]) -> str:
+    score = clean(item.get("score"))
+    total = clean(item.get("total"))
+    response = clean(item.get("response"))
+    if (not score and not total) and response:
+        if response == "correct":
+            score, total = "1", "1"
+        elif response == "incorrect":
+            score, total = "0", "1"
+    if not score or not total:
+        return " score-empty"
+    s = float(score)
+    t = float(total)
+    if t > 0 and s >= t:
+        return " score-full"
+    if s == 0:
+        return " score-zero"
+    return " score-partial"
+
+
+def member_total(items: list[dict[str, Any]]) -> str:
+    score = 0.0
+    total = 0.0
+    seen_score = False
+    for item in items:
+        s = clean(item.get("score"))
+        t = clean(item.get("total"))
+        response = clean(item.get("response"))
+        if (not s and not t) and response:
+            if response == "correct":
+                s, t = "1", "1"
+            elif response == "incorrect":
+                s, t = "0", "1"
+        if s:
+            score += float(s)
+            seen_score = True
+        if t:
+            total += float(t)
+    if not seen_score:
+        return "-"
+    return f"{score:g}/{total:g}" if total else f"{score:g}"
+
+
 def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
     inject_css()
