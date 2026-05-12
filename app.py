@@ -14,7 +14,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 ANNOTATION_DIR = DATA_DIR / "annotations"
 REVIEW_CSV = DATA_DIR / "review_samples.csv"
-APP_VERSION = "row_id_string_safe_score_aligned_2026_05_12"
+APP_VERSION = "score_aligned_no_int_verified_2026_05_12"
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 QUESTION_TASKS = {"KP_Weak", "KP_Stage", "Planning_Progress", "Planning_Target"}
@@ -727,7 +727,7 @@ def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
     inject_css()
     st.title("教师推荐标注")
-st.caption(f"版本：{APP_VERSION}")
+    st.caption(f"版本：{APP_VERSION}")
     st.caption("严格版：只读取规范 review_samples.csv；缺字段或字段语义错误会直接报错，不做兼容兜底。")
 
     df = load_samples()
