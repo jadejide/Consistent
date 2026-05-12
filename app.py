@@ -18,8 +18,8 @@ REVIEW_CSV = DATA_DIR / "review_samples.csv"
 
 DIMENSION_LABELS = {
     "KP_Weak": "知识匹配：薄弱知识匹配",
-    "KP_Stage": "知识匹配：阶段知识匹配",
-    "Planning_Progress": "规划适配：学习进度适配",
+    "KP_Stage": "知识匹配：教学进度知识匹配",
+    "Planning_Progress": "规划适配：学习进程适配",
     "Planning_Target": "规划适配：学习目标适配",
     "Personality_Individual": "个性区分：个体区分",
     "Personality_Group": "个性区分：群体区分",
@@ -30,17 +30,15 @@ TASK_GUIDANCE = {
         "title": "任务说明",
         "goal": "请根据学生历史作答表现，选择最适合用于针对性补弱的候选题。",
         "basis": [
-            "优先关注历史中暴露出的薄弱知识点。",
-            "不要只看表面相似度，要判断是否真的能补当前最关键的弱点。",
-            "如果多个候选都相关，请选你认为最值得优先推荐的一道。",
+            "优先关注历史中暴露出的薄弱知识点。候选题如果能针对这些知识点进行练习，则值得推荐，难度高低暂时不是首要考虑的因素。",
+            "请选你您认为最值得优先推荐的一道。",
         ],
     },
     "KP_Stage": {
         "title": "任务说明",
-        "goal": "请根据学生历史题目与表现，选择最符合当前学习阶段的候选题。",
+        "goal": "请根据学生历史题目与表现，选择最符合当前教学章节的候选题。",
         "basis": [
-            "重点看候选题与当前学习阶段是否一致，而不是只看难度高低。",
-            "优先选择最适合作为当前阶段继续学习的一题。",
+            "重点看候选题与当前教学章节是否一致，教学章节以历史出现频率最高的为准，不考虑难度高低。",
             "如果候选题明显过早或过晚，不应优先推荐。",
         ],
     },
@@ -666,9 +664,9 @@ def render_annotation_form(row: pd.Series, candidates: list[dict]) -> None:
     label_to_text = {item["label"]: item["text"] for item in candidates}
     choice_labels = [""] + [item["label"] for item in candidates] + ["无法判断 / 暂不推荐"]
 
-    st.subheader("老师标注")
-    reviewer_name = st.text_input("标注人", value=default["reviewer_name"] or st.session_state.reviewer_name)
-    st.session_state.reviewer_name = reviewer_name
+    st.subheader("教师推荐标注")
+    # reviewer_name = st.text_input("标注人", value=default["reviewer_name"] or st.session_state.reviewer_name)
+    # st.session_state.reviewer_name = reviewer_name
 
     selected_label = st.radio(
         "请选择你会推荐的候选项",
@@ -702,7 +700,7 @@ def render_annotation_form(row: pd.Series, candidates: list[dict]) -> None:
     )
 
     payload = {
-        "reviewer_name": reviewer_name,
+        # "reviewer_name": reviewer_name,
         "teacher_choice_label": selected_label,
         "teacher_choice_text": label_to_text.get(selected_label, selected_label),
         "teacher_confidence": teacher_confidence,
@@ -762,10 +760,10 @@ def inject_streamlit_css() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="老师推荐标注", layout="wide")
+    st.set_page_config(page_title="教师推荐标注", layout="wide")
     inject_streamlit_css()
-    st.title("老师推荐标注")
-    st.caption("已按当前 CSV 穷举预渲染题目文本；裸 LaTeX 会转成可读 HTML，不再依赖题目自带 $...$。")
+    st.title("教师推荐标注")
+    # st.caption("已按当前 CSV 穷举预渲染题目文本；裸 LaTeX 会转成可读 HTML，不再依赖题目自带 $...$。")
 
     df = load_samples()
     enumerate_render_cache(df)
