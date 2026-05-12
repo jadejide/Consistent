@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -82,7 +83,12 @@ TASK_GUIDANCE = {
 }
 
 VISIBLE_CONTEXT_HINT = {"Planning_Target": "学习目标"}
-LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# 这次数据量不大：启动时把所有题目文本枚举转换成 HTML，避免每次渲染时再猜高度/猜公式。
+RENDER_CACHE: dict[str, str] = {}
+
+SUPERSCRIPT = str.maketrans("0123456789+-=()nix", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱˣ")
+SUBSCRIPT = str.maketrans("0123456789+-=()nix", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₙᵢₓ")
 
 
 def load_samples() -> pd.DataFrame:
@@ -109,14 +115,18 @@ def pretty_dimension(benchmark: str) -> str:
     return DIMENSION_LABELS.get(str(benchmark), str(benchmark))
 
 
-def guidance_for(benchmark: str) -> dict[str, Any]:
+def guidance_for(benchmark: str) -> dict:
     return TASK_GUIDANCE.get(
-        str(benchmark),
-        {"title": "任务说明", "goal": "请根据给定信息，选择你认为最合适的推荐对象。", "basis": ["请按照真实教学推荐习惯进行判断。"]},
+        benchmark,
+        {
+            "title": "任务说明",
+            "goal": "请根据给定信息，选择你认为最合适的推荐对象。",
+            "basis": ["请按照真实教学推荐习惯进行判断。"],
+        },
     )
 
 
-def load_json_items(value: Any) -> list[dict[str, Any]]:
+def load_json_items(value: Any) -> list[dict]:
     text = str(value).strip()
     if not text or text.lower() == "nan":
         return []
@@ -140,285 +150,409 @@ def parse_prefixed_lines(text: Any) -> list[tuple[str, str]]:
     return parsed
 
 
-def build_history_items(row: pd.Series) -> list[dict[str, Any]]:
-    json_items = load_json_items(row.get("history_items_json", ""))
-    if json_items:
-        return [
-            {
-                "index": item.get("index", idx),
-                "text": str(item.get("question_text", "")),
-                "score": item.get("score", ""),
-                "total": item.get("total", ""),
-                "qid": item.get("qid", ""),
-            }
-            for idx, item in enumerate(json_items, start=1)
-        ]
-    return [
-        {"index": idx, "text": body, "score": "", "total": "", "qid": ""}
-        for idx, (_, body) in enumerate(parse_prefixed_lines(row.get("history_preview", "")), start=1)
-    ]
+def build_history_items(text: Any) -> list[dict]:
+    items = []
+    for idx, (_, body) in enumerate(parse_prefixed_lines(text), start=1):
+        items.append({"index": idx, "score": "", "total": "", "question_text": body})
+    return items
 
 
-def build_candidates(row: pd.Series) -> list[dict[str, Any]]:
-    json_items = load_json_items(row.get("candidate_items_json", ""))
-    if json_items:
-        return [
-            {
-                "label": LETTERS[idx] if idx < len(LETTERS) else f"Option-{idx + 1}",
-                "text": str(item.get("question_text", "")),
-                "qid": str(item.get("qid", "")),
-                "is_gt": bool(item.get("is_gt", False)),
-            }
-            for idx, item in enumerate(json_items)
-        ]
-    return [
-        {"label": LETTERS[idx] if idx < len(LETTERS) else f"Option-{idx + 1}", "text": body, "qid": "", "is_gt": False}
-        for idx, (_, body) in enumerate(parse_prefixed_lines(row.get("candidate_preview", "")))
-    ]
+def build_blind_candidates(text: Any) -> list[dict]:
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    candidates: list[dict] = []
+    for idx, (_, body) in enumerate(parse_prefixed_lines(text)):
+        label = letters[idx] if idx < len(letters) else f"Option-{idx + 1}"
+        candidates.append({"label": label, "text": body, "qid": "", "is_gt": False})
+    return candidates
 
 
-def context_text(row: pd.Series) -> str:
-    if str(row.get("benchmark", "")) == "Planning_Target":
-        return str(row.get("gt_signal", "")).strip()
-    return ""
+def _find_matching_brace(text: str, open_pos: int) -> int:
+    depth = 0
+    for i in range(open_pos, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
 
 
-def safe_text(value: Any) -> str:
-    return html.escape(str(value)).replace("\n", "<br>")
+def _replace_command_two_args(text: str, command: str, renderer) -> str:
+    out: list[str] = []
+    i = 0
+    needle = "\\" + command
+    while i < len(text):
+        if not text.startswith(needle, i):
+            out.append(text[i])
+            i += 1
+            continue
+        j = i + len(needle)
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text) or text[j] != "{":
+            out.append(text[i])
+            i += 1
+            continue
+        end1 = _find_matching_brace(text, j)
+        if end1 < 0:
+            out.append(text[i])
+            i += 1
+            continue
+        k = end1 + 1
+        while k < len(text) and text[k].isspace():
+            k += 1
+        if k >= len(text) or text[k] != "{":
+            out.append(text[i])
+            i += 1
+            continue
+        end2 = _find_matching_brace(text, k)
+        if end2 < 0:
+            out.append(text[i])
+            i += 1
+            continue
+        a = text[j + 1 : end1]
+        b = text[k + 1 : end2]
+        out.append(renderer(a, b))
+        i = end2 + 1
+    return "".join(out)
 
 
-def question_card_html(
-    title: str,
-    text: Any,
-    *,
-    badge: str = "",
-    meta: str = "",
-    tone: str = "neutral",
-) -> str:
-    tone_class = {
-        "history": "card-history",
-        "candidate": "card-candidate",
-        "target": "card-target",
-    }.get(tone, "card-neutral")
-    badge_html = f'<span class="badge">{safe_text(badge)}</span>' if badge else ""
-    meta_html = f'<span class="meta">{safe_text(meta)}</span>' if meta else ""
+def _replace_command_one_arg(text: str, command: str, renderer) -> str:
+    out: list[str] = []
+    i = 0
+    needle = "\\" + command
+    while i < len(text):
+        if not text.startswith(needle, i):
+            out.append(text[i])
+            i += 1
+            continue
+        j = i + len(needle)
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text) or text[j] != "{":
+            out.append(text[i])
+            i += 1
+            continue
+        end = _find_matching_brace(text, j)
+        if end < 0:
+            out.append(text[i])
+            i += 1
+            continue
+        a = text[j + 1 : end]
+        out.append(renderer(a))
+        i = end + 1
+    return "".join(out)
+
+
+def _simple_math_escape(s: str) -> str:
+    return html.escape(latex_to_readable_text(s), quote=False)
+
+
+def latex_to_readable_text(raw: Any) -> str:
+    """把本题库常见的裸 LaTeX 转成中文题面可读文本。
+
+    关键点：不要求源文本给 $...$，所以比 MathJax 自动识别更稳。
+    """
+    s = "" if raw is None else str(raw)
+    if s.lower() == "nan":
+        return ""
+
+    # 先处理带参数命令。
+    s = _replace_command_two_args(
+        s,
+        "dfrac",
+        lambda a, b: f"⟦FRAC:{_simple_math_escape(a)}|{_simple_math_escape(b)}⟧",
+    )
+    s = _replace_command_two_args(
+        s,
+        "frac",
+        lambda a, b: f"⟦FRAC:{_simple_math_escape(a)}|{_simple_math_escape(b)}⟧",
+    )
+    s = _replace_command_one_arg(s, "sqrt", lambda a: f"√({_simple_math_escape(a)})")
+    s = _replace_command_one_arg(s, "boldsymbol", lambda a: latex_to_readable_text(a))
+    s = _replace_command_one_arg(s, "mathrm", lambda a: latex_to_readable_text(a))
+    s = _replace_command_one_arg(s, "rm", lambda a: latex_to_readable_text(a))
+    s = _replace_command_one_arg(s, "text", lambda a: latex_to_readable_text(a))
+    s = _replace_command_one_arg(s, "overline", lambda a: f"{latex_to_readable_text(a)}̅")
+    s = _replace_command_one_arg(s, "overparen", lambda a: f"⌒{latex_to_readable_text(a)}")
+
+    replacements = {
+        r"\vartriangle": "△",
+        r"\triangle": "△",
+        r"\angle": "∠",
+        r"\bot": "⊥",
+        r"\perp": "⊥",
+        r"\/\!\/": "∥",
+        r"/\!/": "∥",
+        r"\parallel": "∥",
+        r"\times": "×",
+        r"\div": "÷",
+        r"\cdot": "·",
+        r"\boldsymbol{⋅}": "·",
+        r"\circ": "°",
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\gamma": "γ",
+        r"\theta": "θ",
+        r"\pi": "π",
+        r"\odot": "⊙",
+        r"\leqslant": "≤",
+        r"\leq": "≤",
+        r"\geqslant": "≥",
+        r"\geq": "≥",
+        r"\neq": "≠",
+        r"\sim": "∼",
+        r"\infty": "∞",
+        r"\cdots": "⋯",
+        r"\dots": "…",
+        r"\quad": "　",
+        r"\left": "",
+        r"\right": "",
+        r"\blacksquare": "■",
+        r"\square": "□",
+        r"\#": "#",
+        r"\\": "",
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+
+    # {^\circ} / {^\circ} 这类先转成 °。
+    s = re.sub(r"\{\s*\^\s*°\s*\}", "°", s)
+    s = re.sub(r"\^\s*\{\s*°\s*\}", "°", s)
+
+    # 常见大括号只是 LaTeX 分组：{a^2} -> a^2，{\left(...\right)^2} -> (... )^2。
+    s = re.sub(r"\{([A-Za-z0-9+\-*/=<>≤≥.,，。:：_()（）\[\]αβγθπ°| ]{1,60})\}", r"\1", s)
+
+    # 上下标。复杂内容用括号显示，简单数字/字母用 unicode。
+    def sup_repl(m: re.Match) -> str:
+        body = m.group(1) or m.group(2)
+        body = latex_to_readable_text(body)
+        if re.fullmatch(r"[0-9+\-=()nix]+", body):
+            return body.translate(SUPERSCRIPT)
+        return f"<sup>{html.escape(body)}</sup>"
+
+    def sub_repl(m: re.Match) -> str:
+        body = m.group(1) or m.group(2)
+        body = latex_to_readable_text(body)
+        if re.fullmatch(r"[0-9+\-=()nix]+", body):
+            return body.translate(SUBSCRIPT)
+        return f"<sub>{html.escape(body)}</sub>"
+
+    s = re.sub(r"\^\{([^{}]{1,40})\}|\^([A-Za-z0-9+\-=()])", sup_repl, s)
+    s = re.sub(r"_\{([^{}]{1,40})\}|_([A-Za-z0-9+\-=()])", sub_repl, s)
+
+    # 处理残留的 LaTeX 转义命令，避免页面上出现反斜杠。
+    s = re.sub(r"\\([A-Za-z]+)", r"\1", s)
+    s = s.replace("{", "").replace("}", "")
+    return s
+
+
+def question_to_html(raw: Any) -> str:
+    key = str(raw)
+    if key in RENDER_CACHE:
+        return RENDER_CACHE[key]
+
+    converted = latex_to_readable_text(raw)
+    # 不能整体 escape，因为上面可能插入 <sup>/<sub> 和 FRAC token；先保护 token。
+    converted = converted.replace("\r\n", "\n").replace("\r", "\n")
+    placeholders: dict[str, str] = {}
+
+    def protect_frac(m: re.Match) -> str:
+        token = f"@@FRAC{len(placeholders)}@@"
+        num, den = m.group(1), m.group(2)
+        placeholders[token] = (
+            '<span class="frac"><span class="num">'
+            + num
+            + '</span><span class="den">'
+            + den
+            + '</span></span>'
+        )
+        return token
+
+    converted = re.sub(r"⟦FRAC:(.*?)\|(.*?)⟧", protect_frac, converted)
+
+    # 保护允许的 sup/sub 标签。
+    def protect_tag(m: re.Match) -> str:
+        token = f"@@TAG{len(placeholders)}@@"
+        placeholders[token] = m.group(0)
+        return token
+
+    converted = re.sub(r"</?(?:sup|sub)>", protect_tag, converted)
+    escaped = html.escape(converted, quote=False)
+    escaped = escaped.replace("\n", "<br>")
+    for token, value in placeholders.items():
+        escaped = escaped.replace(token, value)
+
+    # 选择题选项稍微拉开：A. / B. / C. / D. 单独高亮。
+    escaped = re.sub(
+        r"(?<![A-Za-z])([ABCD])\.",
+        r'<span class="option-mark">\1.</span>',
+        escaped,
+    )
+    RENDER_CACHE[key] = escaped
+    return escaped
+
+
+def enumerate_render_cache(df: pd.DataFrame) -> None:
+    texts: list[str] = []
+    for col in ["gt_signal", "gt_candidate_text", "history_preview", "candidate_preview"]:
+        if col in df.columns:
+            texts.extend(str(x) for x in df[col].dropna().tolist())
+    for col in ["history_items_json", "candidate_items_json"]:
+        if col not in df.columns:
+            continue
+        for value in df[col].dropna().tolist():
+            for item in load_json_items(value):
+                text = item.get("question_text")
+                if text:
+                    texts.append(str(text))
+    for text in dict.fromkeys(texts):
+        question_to_html(text)
+
+
+def card_html(title: str, body_html: str, meta: str = "", kind: str = "normal", badge: str = "") -> str:
+    badge_html = f'<span class="badge">{html.escape(badge)}</span>' if badge else ""
+    meta_html = f'<span class="meta">{html.escape(meta)}</span>' if meta else ""
     return f"""
-    <article class="q-card {tone_class}">
-      <header class="q-head">
-        <div class="q-title">{safe_text(title)} {badge_html}</div>
+    <section class="q-card {kind}">
+      <div class="q-head">
+        <div>{badge_html}<span class="q-title">{html.escape(title)}</span></div>
         {meta_html}
-      </header>
-      <div class="q-body tex2jax_process">{safe_text(text)}</div>
-    </article>
+      </div>
+      <div class="q-body">{body_html}</div>
+    </section>
     """
 
 
-def page_html(row: pd.Series, history_items: list[dict[str, Any]], candidates: list[dict[str, Any]]) -> str:
-    benchmark = str(row.get("benchmark", ""))
-    guide = guidance_for(benchmark)
-    basis_items = "".join(f"<li>{safe_text(item)}</li>" for item in guide["basis"])
-
-    extra_context = context_text(row)
-    context_block = ""
-    if extra_context:
-        context_block = question_card_html(
-            VISIBLE_CONTEXT_HINT.get(benchmark, "补充信息"), extra_context, tone="target"
-        )
-
-    history_cards = []
-    for item in history_items:
-        score = ""
-        if item.get("score") != "" or item.get("total") != "":
-            score = f"得分 {item.get('score', '')}/{item.get('total', '')}"
-        qid = f"题号 {item.get('qid')}" if item.get("qid") else ""
-        meta = " · ".join(x for x in [score, qid] if x)
-        history_cards.append(
-            question_card_html(f"历史 {item.get('index', '')}", item.get("text", ""), meta=meta, tone="history")
-        )
-
-    candidate_cards = []
-    for item in candidates:
-        meta = f"题号 {item.get('qid')}" if item.get("qid") else ""
-        # 不展示 is_gt，避免标注泄漏。只保留在导出/调试数据里。
-        candidate_cards.append(
-            question_card_html(
-                f"候选 {item['label']}", item.get("text", ""), badge=item["label"], meta=meta, tone="candidate"
-            )
-        )
-
-    return f"""
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8" />
-      <script>
-        window.MathJax = {{
-          tex: {{
-            inlineMath: [['$', '$'], ['\\\\(', '\\\\)']],
-            displayMath: [['$$', '$$'], ['\\\\[', '\\\\]']],
-            processEscapes: true
-          }},
-          svg: {{ fontCache: 'global' }},
-          options: {{ skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }}
-        }};
-      </script>
-      <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
-      <style>
-        :root {{
-          --border: #e5e7eb;
-          --muted: #6b7280;
-          --text: #111827;
-          --bg-soft: #f9fafb;
-          --blue-soft: #eff6ff;
-          --blue-border: #bfdbfe;
-          --amber-soft: #fffbeb;
-          --amber-border: #fde68a;
-          --green-soft: #f0fdf4;
-          --green-border: #bbf7d0;
-        }}
-        * {{ box-sizing: border-box; }}
-        body {{
-          margin: 0;
-          padding: 0 4px 18px 0;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-          color: var(--text);
-          background: white;
-        }}
-        .top-card {{
-          border: 1px solid var(--border);
-          background: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
-          border-radius: 18px;
-          padding: 16px 18px;
-          margin-bottom: 14px;
-        }}
-        .dim {{
-          font-size: 22px;
-          font-weight: 800;
-          letter-spacing: .2px;
-          margin-bottom: 8px;
-        }}
-        .goal {{
-          font-size: 17px;
-          line-height: 1.65;
-          margin: 8px 0 10px;
-        }}
-        .basis-title {{
-          font-weight: 750;
-          margin-top: 10px;
-        }}
-        ul {{ margin: 8px 0 0 22px; padding: 0; }}
-        li {{ line-height: 1.7; margin: 2px 0; }}
-        .section-title {{
-          display: flex;
-          align-items: center;
-          gap: 9px;
-          margin: 20px 0 10px;
-          font-size: 20px;
-          font-weight: 800;
-        }}
-        .section-title:before {{
-          content: "";
-          width: 5px;
-          height: 21px;
-          border-radius: 999px;
-          background: #2563eb;
-        }}
-        .q-card {{
-          border: 1px solid var(--border);
-          border-radius: 18px;
-          margin: 10px 0 14px;
-          padding: 0;
-          overflow: hidden;
-          box-shadow: 0 1px 3px rgba(0,0,0,.045);
-        }}
-        .card-history {{ background: var(--bg-soft); }}
-        .card-candidate {{ background: #fff; border-color: var(--blue-border); }}
-        .card-target {{ background: var(--green-soft); border-color: var(--green-border); }}
-        .q-head {{
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          padding: 10px 14px;
-          border-bottom: 1px solid rgba(229,231,235,.9);
-          background: rgba(255,255,255,.72);
-        }}
-        .q-title {{
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          font-weight: 800;
-          font-size: 16px;
-          white-space: nowrap;
-        }}
-        .badge {{
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          min-width: 27px;
-          height: 27px;
-          padding: 0 9px;
-          border-radius: 999px;
-          color: #1d4ed8;
-          background: #dbeafe;
-          font-weight: 850;
-        }}
-        .meta {{
-          color: var(--muted);
-          font-size: 13px;
-          text-align: right;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }}
-        .q-body {{
-          font-size: 18px;
-          line-height: 1.82;
-          padding: 15px 16px 18px;
-          word-break: break-word;
-          overflow-wrap: anywhere;
-        }}
-        .card-candidate .q-body {{ font-size: 19px; }}
-        mjx-container[jax="SVG"][display="true"] {{
-          overflow-x: auto;
-          overflow-y: hidden;
-          max-width: 100%;
-          padding: 4px 0;
-        }}
-        mjx-container {{ outline: none; }}
-      </style>
-    </head>
-    <body>
-      <section class="top-card">
-        <div class="dim">{safe_text(pretty_dimension(benchmark))}</div>
-        <div class="basis-title">{safe_text(guide['title'])}</div>
-        <div class="goal">{safe_text(guide['goal'])}</div>
-        <div class="basis-title">推荐依据</div>
-        <ul>{basis_items}</ul>
-      </section>
-      {context_block}
-      <div class="section-title">历史信息</div>
-      {''.join(history_cards) if history_cards else '<div class="q-card"><div class="q-body">暂无历史信息</div></div>'}
-      <div class="section-title">候选题目</div>
-      {''.join(candidate_cards) if candidate_cards else '<div class="q-card"><div class="q-body">暂无候选项</div></div>'}
-    </body>
-    </html>
+def page_css() -> str:
+    return """
+    <style>
+      :root { color-scheme: light; }
+      body {
+        margin: 0;
+        background: #f8fafc;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+        color: #0f172a;
+      }
+      .wrap { padding: 4px 2px 18px; }
+      .guide {
+        border: 1px solid #dbeafe;
+        background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
+        border-radius: 16px;
+        padding: 14px 16px;
+        margin-bottom: 14px;
+      }
+      .guide h3 { margin: 0 0 8px; font-size: 19px; }
+      .guide p { margin: 4px 0; line-height: 1.72; }
+      .guide ul { margin: 7px 0 0 22px; padding: 0; line-height: 1.7; }
+      .section-title {
+        font-size: 19px;
+        font-weight: 800;
+        margin: 18px 0 10px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .section-title:before {
+        content: "";
+        display: inline-block;
+        width: 5px;
+        height: 18px;
+        border-radius: 999px;
+        background: #2563eb;
+      }
+      .q-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 17px;
+        background: #ffffff;
+        padding: 13px 15px 14px;
+        margin: 10px 0;
+        box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+      }
+      .q-card.history { border-left: 5px solid #94a3b8; }
+      .q-card.candidate { border-left: 5px solid #2563eb; }
+      .q-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+      .q-title { font-weight: 800; font-size: 16px; color: #111827; }
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 26px;
+        height: 26px;
+        margin-right: 8px;
+        padding: 0 8px;
+        border-radius: 999px;
+        background: #2563eb;
+        color: white;
+        font-weight: 900;
+        font-size: 14px;
+      }
+      .meta {
+        flex: none;
+        color: #64748b;
+        background: #f1f5f9;
+        border-radius: 999px;
+        padding: 3px 9px;
+        font-size: 13px;
+      }
+      .q-body {
+        font-size: 18px;
+        line-height: 1.86;
+        letter-spacing: 0.01em;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+      }
+      .frac {
+        display: inline-grid;
+        grid-template-rows: auto auto;
+        align-items: center;
+        justify-items: center;
+        vertical-align: middle;
+        margin: 0 0.12em;
+        line-height: 1.05;
+        font-size: 0.94em;
+      }
+      .frac .num {
+        border-bottom: 1.5px solid currentColor;
+        padding: 0 0.22em 0.08em;
+      }
+      .frac .den { padding: 0.08em 0.22em 0; }
+      sup, sub { line-height: 0; font-size: 0.72em; }
+      .option-mark {
+        display: inline-block;
+        margin-left: 0.55em;
+        margin-right: 0.1em;
+        padding: 0 0.28em;
+        border-radius: 6px;
+        background: #eef2ff;
+        color: #3730a3;
+        font-weight: 800;
+      }
+    </style>
     """
 
 
-def render_question_panel(row: pd.Series, history_items: list[dict[str, Any]], candidates: list[dict[str, Any]]) -> None:
-    # 只用一个 iframe 渲染所有题目，避免每道题一个 components.html 导致高度错乱和闪烁。
-    item_count = len(history_items) + len(candidates)
-    text_len = sum(len(str(x.get("text", ""))) for x in history_items + candidates)
-    height = min(3600, max(760, 430 + item_count * 145 + text_len // 12))
-    components.html(page_html(row, history_items, candidates), height=height, scrolling=True)
+def render_html_panel(html_body: str, min_height: int = 560) -> None:
+    # 直接给足高度，避免 iframe 内部出现二级滚动；题目少，宁可页面长一点。
+    height = max(min_height, 220 + html_body.count("q-card") * 170 + html_body.count("<br>") * 18)
+    components.html(
+        f"<html><head><meta charset='utf-8'>{page_css()}</head><body><main class='wrap'>{html_body}</main></body></html>",
+        height=height,
+        scrolling=False,
+    )
 
 
 def get_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.header("筛选")
     dimension_options = ["全部"] + [pretty_dimension(x) for x in sorted(df["benchmark"].dropna().unique().tolist())]
     selected_dimension = st.sidebar.selectbox("维度", dimension_options)
-
     out = df
     if selected_dimension != "全部":
         reverse_map = {pretty_dimension(x): x for x in df["benchmark"].dropna().unique().tolist()}
@@ -426,7 +560,88 @@ def get_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def default_annotation(row_id: int) -> dict[str, Any]:
+def context_text(row: pd.Series) -> str:
+    benchmark = str(row.get("benchmark", ""))
+    if benchmark == "Planning_Target":
+        goal = str(row.get("gt_signal", "")).strip()
+        if goal and goal.lower() != "nan":
+            return goal
+    return ""
+
+
+def get_history_items(row: pd.Series) -> list[dict]:
+    items = load_json_items(row.get("history_items_json", ""))
+    if items:
+        return items
+    return build_history_items(row.get("history_preview", ""))
+
+
+def get_candidates(row: pd.Series) -> list[dict]:
+    raw_candidates = load_json_items(row.get("candidate_items_json", ""))
+    if raw_candidates:
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return [
+            {
+                "label": letters[idx] if idx < len(letters) else f"Option-{idx + 1}",
+                "text": str(item.get("question_text", "")),
+                "qid": str(item.get("qid", "")),
+                # 保留在导出，不展示在界面。
+                "is_gt": bool(item.get("is_gt", False)),
+            }
+            for idx, item in enumerate(raw_candidates)
+        ]
+    return build_blind_candidates(row.get("candidate_preview", ""))
+
+
+def build_question_panel(row: pd.Series, candidates: list[dict]) -> str:
+    benchmark = str(row.get("benchmark", ""))
+    guide = guidance_for(benchmark)
+    body = [
+        "<div class='guide'>",
+        f"<h3>{html.escape(pretty_dimension(benchmark))}</h3>",
+        f"<p><b>{html.escape(guide['title'])}</b>：{html.escape(guide['goal'])}</p>",
+        "<ul>",
+    ]
+    for item in guide["basis"]:
+        body.append(f"<li>{html.escape(item)}</li>")
+    body.append("</ul>")
+    extra = context_text(row)
+    if extra:
+        hint = VISIBLE_CONTEXT_HINT.get(benchmark, "补充信息")
+        body.append(f"<p><b>{html.escape(hint)}：</b>{question_to_html(extra)}</p>")
+    focus = str(row.get("teacher_check_focus", "")).strip()
+    if focus and focus.lower() != "nan":
+        body.append(f"<p><b>检查重点：</b>{html.escape(focus)}</p>")
+    body.append("</div>")
+
+    body.append("<div class='section-title'>历史信息</div>")
+    for item in get_history_items(row):
+        idx = item.get("index", "")
+        score = item.get("score", "")
+        total = item.get("total", "")
+        meta = ""
+        if score != "" and total != "":
+            meta = f"得分 {score}/{total}"
+        title = f"历史 {idx}" if idx != "" else "历史"
+        body.append(card_html(title, question_to_html(item.get("question_text", "")), meta=meta, kind="history"))
+
+    body.append("<div class='section-title'>候选项</div>")
+    for candidate in candidates:
+        label = candidate["label"]
+        meta = candidate.get("qid", "")
+        body.append(
+            card_html(
+                f"候选 {label}",
+                question_to_html(candidate.get("text", "")),
+                meta=meta,
+                kind="candidate",
+                badge=label,
+            )
+        )
+    return "\n".join(body)
+
+
+def default_annotation(row_id: int) -> dict:
     return {
         "reviewer_name": st.session_state.reviewer_name,
         "teacher_choice_label": "",
@@ -437,77 +652,74 @@ def default_annotation(row_id: int) -> dict[str, Any]:
     }
 
 
-def get_annotation(row_id: int) -> dict[str, Any]:
+def get_annotation(row_id: int) -> dict:
     return st.session_state.annotations.get(row_id, default_annotation(row_id))
 
 
-def set_annotation(row_id: int, payload: dict[str, Any]) -> None:
+def set_annotation(row_id: int, payload: dict) -> None:
     st.session_state.annotations[row_id] = payload
 
 
-def render_annotation_form(row: pd.Series, candidates: list[dict[str, Any]]) -> None:
+def render_annotation_form(row: pd.Series, candidates: list[dict]) -> None:
     row_id = int(row["row_id"])
     default = get_annotation(row_id)
     label_to_text = {item["label"]: item["text"] for item in candidates}
     choice_labels = [""] + [item["label"] for item in candidates] + ["无法判断 / 暂不推荐"]
 
-    with st.container(border=True):
-        st.subheader("老师标注")
-        reviewer_name = st.text_input("标注人", value=default["reviewer_name"] or st.session_state.reviewer_name)
-        st.session_state.reviewer_name = reviewer_name
+    st.subheader("老师标注")
+    reviewer_name = st.text_input("标注人", value=default["reviewer_name"] or st.session_state.reviewer_name)
+    st.session_state.reviewer_name = reviewer_name
 
-        selected_label = st.radio(
-            "请选择你会推荐的候选项",
-            options=choice_labels,
-            index=choice_labels.index(default["teacher_choice_label"])
-            if default["teacher_choice_label"] in choice_labels
-            else 0,
-            format_func=lambda x: "请选择" if x == "" else x,
-        )
-
-        selected_text = label_to_text.get(selected_label, "")
-        if selected_text:
-            with st.expander("查看已选候选题", expanded=True):
-                st.markdown(f"**候选 {selected_label}**")
-                st.write(selected_text)
-
-        teacher_confidence = st.slider("推荐把握度", 1, 5, int(default["teacher_confidence"]))
-        teacher_reason = st.text_area(
-            "推荐理由",
-            value=default["teacher_reason"],
-            height=150,
-            placeholder="请说明你为什么会推荐这个候选项。",
-        )
-        teacher_comment = st.text_area(
-            "补充备注",
-            value=default["teacher_comment"],
-            height=110,
-            placeholder="可记录歧义、样本问题、其他备选意见等。",
-        )
-
-    set_annotation(
-        row_id,
-        {
-            "reviewer_name": reviewer_name,
-            "teacher_choice_label": selected_label,
-            "teacher_choice_text": label_to_text.get(selected_label, selected_label),
-            "teacher_confidence": teacher_confidence,
-            "teacher_reason": teacher_reason,
-            "teacher_comment": teacher_comment,
-        },
+    selected_label = st.radio(
+        "请选择你会推荐的候选项",
+        options=choice_labels,
+        index=choice_labels.index(default["teacher_choice_label"])
+        if default["teacher_choice_label"] in choice_labels
+        else 0,
+        format_func=lambda x: "请选择" if x == "" else x,
+        horizontal=True,
     )
+    if selected_label and selected_label in label_to_text:
+        with st.expander(f"已选候选 {selected_label} 预览", expanded=True):
+            components.html(
+                f"<html><head><meta charset='utf-8'>{page_css()}</head><body><div class='q-body'>{question_to_html(label_to_text[selected_label])}</div></body></html>",
+                height=220,
+                scrolling=True,
+            )
+
+    teacher_confidence = st.slider("推荐把握度", 1, 5, int(default["teacher_confidence"]))
+    teacher_reason = st.text_area(
+        "推荐理由",
+        value=default["teacher_reason"],
+        height=150,
+        placeholder="请说明你为什么会推荐这个候选项。",
+    )
+    teacher_comment = st.text_area(
+        "补充备注",
+        value=default["teacher_comment"],
+        height=120,
+        placeholder="可记录歧义、样本问题、其他备选意见等。",
+    )
+
+    payload = {
+        "reviewer_name": reviewer_name,
+        "teacher_choice_label": selected_label,
+        "teacher_choice_text": label_to_text.get(selected_label, selected_label),
+        "teacher_confidence": teacher_confidence,
+        "teacher_reason": teacher_reason,
+        "teacher_comment": teacher_comment,
+    }
+    set_annotation(row_id, payload)
 
 
 def render_progress(filtered: pd.DataFrame) -> None:
     selected_ids = set(filtered["row_id"].tolist())
-    annotated = sum(
-        1
-        for row_id in selected_ids
-        if st.session_state.annotations.get(row_id, {}).get("teacher_choice_label")
-    )
+    annotated = 0
+    for row_id in selected_ids:
+        item = st.session_state.annotations.get(row_id)
+        if item and item.get("teacher_choice_label"):
+            annotated += 1
     st.sidebar.metric("当前筛选下已标注", f"{annotated}/{len(filtered)}")
-    if len(filtered):
-        st.sidebar.progress(annotated / len(filtered))
 
 
 def build_export_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -515,7 +727,14 @@ def build_export_df(df: pd.DataFrame) -> pd.DataFrame:
     by_id = df.set_index("row_id").to_dict(orient="index")
     for row_id, annotation in st.session_state.annotations.items():
         base = by_id.get(row_id, {})
-        rows.append({"row_id": row_id, **base, **annotation, "saved_at": datetime.now().isoformat(timespec="seconds")})
+        rows.append(
+            {
+                "row_id": row_id,
+                **base,
+                **annotation,
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -528,25 +747,14 @@ def save_local_annotations(export_df: pd.DataFrame, reviewer_name: str) -> Path:
     return path
 
 
-def inject_app_css() -> None:
+def inject_streamlit_css() -> None:
     st.markdown(
         """
         <style>
-          .block-container { padding-top: 1.4rem; max-width: 1500px; }
-          [data-testid="stSidebar"] { min-width: 285px; }
-          div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 18px; }
-          .stRadio [role="radiogroup"] {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 6px 8px;
-          }
-          .stRadio label {
-            border: 1px solid #e5e7eb;
-            border-radius: 12px;
-            padding: 8px 10px;
-            background: #fff;
-          }
-          .stTextArea textarea { line-height: 1.55; }
+          .block-container { padding-top: 1.4rem; padding-bottom: 2rem; max-width: 1480px; }
+          div[data-testid="stVerticalBlock"] { gap: 0.65rem; }
+          section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] { gap: 0.6rem; }
+          .stRadio [role="radiogroup"] { gap: 0.38rem 0.65rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -555,12 +763,12 @@ def inject_app_css() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="老师推荐标注", layout="wide")
-    inject_app_css()
-
+    inject_streamlit_css()
     st.title("老师推荐标注")
-    st.caption("请根据任务说明、历史信息和候选题目，像真实教学推荐一样做选择。页面不会展示模型结果。")
+    st.caption("已按当前 CSV 穷举预渲染题目文本；裸 LaTeX 会转成可读 HTML，不再依赖题目自带 $...$。")
 
     df = load_samples()
+    enumerate_render_cache(df)
     init_state(df)
     filtered = get_filtered_df(df)
 
@@ -570,33 +778,34 @@ def main() -> None:
 
     render_progress(filtered)
 
-    current_index = min(st.session_state.current_index, len(filtered) - 1)
+    if st.session_state.current_index >= len(filtered):
+        st.session_state.current_index = 0
+
     row_ids = filtered["row_id"].tolist()
     selected_row_id = st.sidebar.selectbox(
         "跳转到样本",
         row_ids,
-        index=current_index,
+        index=min(st.session_state.current_index, len(row_ids) - 1),
         format_func=lambda rid: f"{rid} | {pretty_dimension(filtered[filtered['row_id'] == rid].iloc[0]['benchmark'])}",
     )
     st.session_state.current_index = int(filtered.index[filtered["row_id"] == selected_row_id][0])
-    row = filtered.iloc[st.session_state.current_index]
 
-    nav1, nav2, nav3, nav4 = st.columns([1, 1, 4, 1.4])
-    if nav1.button("上一条", use_container_width=True, disabled=st.session_state.current_index <= 0):
+    nav1, nav2, nav3 = st.columns([1, 1, 4])
+    if nav1.button("上一条", use_container_width=True) and st.session_state.current_index > 0:
         st.session_state.current_index -= 1
         st.rerun()
-    if nav2.button("下一条", use_container_width=True, disabled=st.session_state.current_index >= len(filtered) - 1):
+    if nav2.button("下一条", use_container_width=True) and st.session_state.current_index < len(filtered) - 1:
         st.session_state.current_index += 1
         st.rerun()
     nav3.progress((st.session_state.current_index + 1) / len(filtered))
-    nav4.caption(f"样本 {st.session_state.current_index + 1} / {len(filtered)}")
+    st.caption(f"样本 {st.session_state.current_index + 1} / {len(filtered)}")
 
-    history_items = build_history_items(row)
-    candidates = build_candidates(row)
+    row = filtered.iloc[st.session_state.current_index]
+    candidates = get_candidates(row)
 
-    left, right = st.columns([1.55, 1], gap="large")
+    left, right = st.columns([1.55, 1.0], gap="large")
     with left:
-        render_question_panel(row, history_items, candidates)
+        render_html_panel(build_question_panel(row, candidates))
     with right:
         render_annotation_form(row, candidates)
 
@@ -604,20 +813,16 @@ def main() -> None:
     export_df = build_export_df(df)
     st.subheader("导出")
     st.write(f"当前会话已保存标注：{len(export_df)}")
-
     download_bytes = export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     st.download_button(
         "下载标注 CSV",
         data=download_bytes,
         file_name="teacher_recommendation_annotations.csv",
         mime="text/csv",
-        use_container_width=True,
     )
-
     if st.button("保存到本地文件"):
         path = save_local_annotations(export_df, st.session_state.reviewer_name)
         st.success(f"已保存到 {path}")
-
     with st.expander("当前会话标注预览", expanded=False):
         st.dataframe(export_df, use_container_width=True)
 
