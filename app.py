@@ -13,7 +13,7 @@ import streamlit as st
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 ANNOTATION_DIR = DATA_DIR / "annotations"
-CSV_CANDIDATES = [DATA_DIR / "review_samples.csv", APP_DIR / "review_samples.csv", Path("/mnt/data/review_samples.csv")]
+CSV_CANDIDATES = [DATA_DIR / "review_samples.csv"]
 
 TASK_LABELS = {
     "KP_Weak": "知识匹配：薄弱知识匹配",
