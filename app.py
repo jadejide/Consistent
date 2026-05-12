@@ -790,6 +790,118 @@ def member_total(items: list[dict[str, Any]]) -> str:
     return f"{score:g}/{total:g}" if total else f"{score:g}"
 
 
+TEACHER_TASK_GUIDANCE = {
+    "KP_Weak": {
+        "goal": "请站在老师日常补弱推荐的角度，从候选题中选出你最愿意优先推荐给这位学生的一题。",
+        "basis": [
+            "重点看历史作答中反复暴露出的薄弱知识点，优先推荐能直接针对这些薄弱点继续练习的题。",
+            "这一维度主要看知识针对性，先不要把题目难度当成首要标准，因为当前样本构造时也没有把难度作为核心约束。",
+            "请只在当前候选题中做选择，不要发散到候选集外更理想的题目；按这组候选里最符合补弱目的的一题来选。",
+        ],
+    },
+    "KP_Stage": {
+        "goal": "请按老师推进教学进度的习惯，从候选题中选出最适合当前知识阶段的一题。",
+        "basis": [
+            "重点判断题目所属章节、知识阶段是否和学生当前学习位置匹配，而不是单纯比较谁更难、更新或更综合。",
+            "如果题目明显超前或明显滞后，即使题目本身不错，也不应优先推荐。",
+            "请只在当前候选题中做选择，不要发散到候选集外更完整的教学安排；按现阶段最贴切的一题来选。",
+        ],
+    },
+    "Planning_Progress": {
+        "goal": "请根据学生最近的作答轨迹，从候选题中选出最适合作为下一步练习的一题。",
+        "basis": [
+            "把它理解成老师看完最近几次练习后，要决定下一题该继续推进、先巩固，还是先回退修补。",
+            "重点依据最近作答对错形成的学习轨迹来判断，不必把它理解成一个抽象状态分类任务。",
+            "请只在当前候选题中做选择，不要发散到更长周期的教学设计；按最合理的下一步练习来选。",
+        ],
+    },
+    "Planning_Target": {
+        "goal": "请在给定学习目标下，从候选题中选出最能推动该目标达成的一题。",
+        "basis": [
+            "这里最重要的是题目是否真正服务于当前学习目标，而不是是否与历史题面更像、覆盖更广或看起来更高级。",
+            "如果某题虽然整体更好，但对当前目标帮助不直接，就不应优先推荐。",
+            "请只在当前候选题中做选择，不要发散到候选集外更理想的题；按最能朝目标再推进一步的一题来选。",
+        ],
+    },
+    "Personality_Individual": {
+        "goal": "给定目标题目，请从候选学生中选出你最愿意把这道题推荐给的学生。",
+        "basis": [
+            "重点看这道题与候选学生既有表现之间的匹配程度，而不只是看谁总体成绩更高。",
+            "把它理解成老师面对这道具体题时，会优先推给哪位学生更合适，而不是做长期分层判断。",
+            "请只在当前候选学生中做选择，不要发散到重新分层或候选集外其他学生；按这道题最适合谁来选。",
+        ],
+    },
+    "Personality_Group": {
+        "goal": "给定目标题目，请从候选学生组中选出你最愿意把这道题推荐给的学生组。",
+        "basis": [
+            "重点看小组整体能力结构与这道题的匹配程度，而不是只看单个最强成员或平均分最高的小组。",
+            "如果某组更适合通过这道题获得推进，即使它不是整体最强组，也可以优先推荐。",
+            "请只在当前候选学生组中做选择，不要发散到重新分组；按这道题最适合给哪个组来选。",
+        ],
+    },
+}
+
+
+def render_task(row: pd.Series) -> None:
+    benchmark = clean(row["benchmark"])
+    info = TEACHER_TASK_GUIDANCE.get(benchmark, {"goal": "", "basis": []})
+    bullets = "".join(f"<li>{html.escape(x)}</li>" for x in info["basis"])
+    html_block(
+        "<div class='task-card'>"
+        f"<div class='card-title'>{html.escape(TASK_LABELS.get(benchmark, benchmark))}</div>"
+        f"<div class='smalltext'><b>任务：</b>{html.escape(info['goal'])}</div>"
+        f"<ul class='smalltext'>{bullets}</ul>"
+        "</div>"
+    )
+
+
+def render_full_history_questions(entities: list[dict[str, Any]]) -> None:
+    html_block("<div class='section-title'>完整历史题目</div>")
+    html_block(
+        "<div class='section-card'><div class='smalltext'>"
+        "<b>阅读方式：</b>先完整看一遍共享历史题，形成对题型与知识要求的整体印象；"
+        "随后再比较每个候选学生或学生组在这些题上的表现记录。"
+        "</div></div>"
+    )
+    for item in collect_questions(entities):
+        idx = clean(item.get("index"))
+        qid = clean(item.get("qid"))
+        card(f"历史题 Q{idx}", item["question_text"], meta=qid, kind="section-card history-card")
+
+
+def render_question_history(items: list[dict[str, Any]], benchmark: str) -> None:
+    if benchmark == "KP_Stage":
+        render_history_questions(items, "学生历史题目", show_score=False)
+        return
+    if benchmark == "Planning_Progress":
+        render_history_score_table(items, "学生最近学习轨迹 / 得分记录")
+        return
+    render_history_score_table(items, "学生历史作答记录")
+
+
+def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
+    benchmark = clean(row["benchmark"])
+    row_id = clean(row["row_id"])
+    render_task(row)
+
+    if benchmark == "Planning_Target" and clean(row["learning_goal"]):
+        card("学习目标", row["learning_goal"], kind="goal-card")
+
+    if benchmark in QUESTION_TASKS:
+        history = json_list(row["history_items_json"], "history_items_json", row_id)
+        candidates = json_list(row["candidate_items_json"], "candidate_items_json", row_id)
+        render_question_history(history, benchmark)
+        render_question_candidates(candidates)
+        return candidates, "question"
+
+    target = json_dict(row["target_question_json"], "target_question_json", row_id)
+    entities = json_list(row["candidate_entities_json"], "candidate_entities_json", row_id)
+    card("目标题目", target["question_text"], meta=clean(target.get("qid")), kind="target-card")
+    render_full_history_questions(entities)
+    render_entity_candidates(entities, benchmark)
+    return entities, "entity"
+
+
 def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
     inject_css()
