@@ -13,7 +13,7 @@ import streamlit as st
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 ANNOTATION_DIR = DATA_DIR / "annotations"
-CSV_CANDIDATES = [DATA_DIR / "review_samples.csv"]
+CSV_CANDIDATES = [DATA_DIR / "review_samples.csv", APP_DIR / "review_samples.csv", Path("/mnt/data/review_samples.csv")]
 
 TASK_LABELS = {
     "KP_Weak": "知识匹配：薄弱知识匹配",
@@ -99,9 +99,12 @@ def find_csv() -> Path:
 
 
 def load_samples() -> pd.DataFrame:
-    df = pd.read_csv(find_csv())
+    df = pd.read_csv(find_csv(), dtype={"row_id": "string"})
     if "row_id" not in df.columns:
-        df.insert(0, "row_id", range(1, len(df) + 1))
+        df.insert(0, "row_id", [str(i) for i in range(1, len(df) + 1)])
+    else:
+        # row_id 可能是 uuid / benchmark_sampleid 这类字符串，绝不能转 int。
+        df["row_id"] = df["row_id"].astype(str)
     for col in [
         "benchmark", "task_type", "task_label", "learning_goal", "progress_state",
         "weak_knowledge_points", "stage_knowledge_points", "target_question_json",
@@ -536,7 +539,7 @@ def init_state(df: pd.DataFrame) -> None:
     st.session_state.setdefault("annotations", {})
     st.session_state.setdefault("current_index", 0)
     valid = set(df["row_id"].astype(str).tolist())
-    st.session_state.annotations = {int(k): v for k, v in st.session_state.annotations.items() if int(k) in valid}
+    st.session_state.annotations = {str(k): v for k, v in st.session_state.annotations.items() if str(k) in valid}
 
 
 def default_annotation() -> dict[str, Any]:
@@ -544,7 +547,7 @@ def default_annotation() -> dict[str, Any]:
 
 
 def render_annotation_form(row: pd.Series, choices: list[dict[str, Any]], choice_type: str) -> None:
-    row_id = int(row["row_id"])
+    row_id = clean_str(row["row_id"])
     current = {**default_annotation(), **st.session_state.annotations.get(row_id, {})}
     labels = [clean_str(x.get("label", "")) for x in choices if clean_str(x.get("label", ""))]
     options = [""] + labels + ["无法判断 / 暂不推荐"]
@@ -622,7 +625,7 @@ def main() -> None:
         st.warning("当前筛选下没有样本。")
         return
 
-    annotated = sum(1 for rid in filtered["row_id"].tolist() if st.session_state.annotations.get(int(rid), {}).get("teacher_choice_label"))
+    annotated = sum(1 for rid in filtered["row_id"].astype(str).tolist() if st.session_state.annotations.get(str(rid), {}).get("teacher_choice_label"))
     st.sidebar.metric("当前筛选已标注", f"{annotated}/{len(filtered)}")
     if st.session_state.current_index >= len(filtered):
         st.session_state.current_index = 0
