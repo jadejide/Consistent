@@ -14,7 +14,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 ANNOTATION_DIR = DATA_DIR / "annotations"
 REVIEW_CSV = DATA_DIR / "review_samples.csv"
-APP_VERSION = "score_aligned_no_int_verified_2026_05_12"
+APP_VERSION = "single_history_score_aligned_2026_05_12"
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 QUESTION_TASKS = {"KP_Weak", "KP_Stage", "Planning_Progress", "Planning_Target"}
@@ -517,17 +517,25 @@ def render_history_questions(items: list[dict[str, Any]], title: str, show_score
 
 
 def render_question_history(items: list[dict[str, Any]], benchmark: str) -> None:
+    """Render history exactly once for non-Personality tasks.
+
+    Personality tasks are special: teachers first read the full shared question set,
+    then compare entity score matrices with short hints. For question-recommendation
+    tasks, repeating the same history as both a table and full cards wastes visual
+    attention, so each benchmark gets one history view only.
+    """
     if benchmark == "KP_Stage":
+        # 教学进度只判断章节 / 知识阶段：只看题目，不把得分放大。
         render_history_questions(items, "学生历史题目", show_score=False)
         return
 
     if benchmark == "Planning_Progress":
+        # 学习进程必须看轨迹和得分：用个性区分同款表格，但不再重复展示完整题。
         render_history_score_table(items, "学生最近学习轨迹 / 得分记录")
-        render_history_questions(items, "完整历史题目", show_score=True)
         return
 
+    # 薄弱匹配和目标适配也需要看到作答表现，但只展示一次。
     render_history_score_table(items, "学生历史作答记录")
-    render_history_questions(items, "完整历史题目", show_score=True)
 
 
 def render_question_candidates(items: list[dict[str, Any]]) -> None:
