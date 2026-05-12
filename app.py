@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,10 +15,10 @@ DATA_DIR = APP_DIR / "data"
 ANNOTATION_DIR = DATA_DIR / "annotations"
 REVIEW_CSV = DATA_DIR / "review_samples.csv"
 
-DIMENSION_LABELS = {
+BENCHMARK_LABELS = {
     "KP_Weak": "知识匹配：薄弱知识匹配",
-    "KP_Stage": "知识匹配：教学进度知识匹配",
-    "Planning_Progress": "规划适配：学习进程适配",
+    "KP_Stage": "知识匹配：阶段知识匹配",
+    "Planning_Progress": "规划适配：学习进度适配",
     "Planning_Target": "规划适配：学习目标适配",
     "Personality_Individual": "个性区分：个体区分",
     "Personality_Group": "个性区分：群体区分",
@@ -80,347 +79,114 @@ TASK_GUIDANCE = {
     },
 }
 
-VISIBLE_CONTEXT_HINT = {"Planning_Target": "学习目标"}
-
-# 这次数据量不大：启动时把所有题目文本枚举转换成 HTML，避免每次渲染时再猜高度/猜公式。
-RENDER_CACHE: dict[str, str] = {}
-
-SUPERSCRIPT = str.maketrans("0123456789+-=()nix", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱˣ")
-SUBSCRIPT = str.maketrans("0123456789+-=()nix", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₙᵢₓ")
-
 
 def load_samples() -> pd.DataFrame:
     if not REVIEW_CSV.exists():
-        raise FileNotFoundError(f"缺少样本文件: {REVIEW_CSV}")
+        raise FileNotFoundError(f"缺少样本文件：{REVIEW_CSV}")
     df = pd.read_csv(REVIEW_CSV)
     if "row_id" not in df.columns:
         df = df.copy()
-        df.insert(0, "row_id", range(1, len(df) + 1))
+        df.insert(0, "row_id", [f"row_{idx + 1}" for idx in range(len(df))])
+    df["row_id"] = df["row_id"].astype(str)
     return df
 
 
 def init_state(df: pd.DataFrame) -> None:
     st.session_state.setdefault("annotations", {})
     st.session_state.setdefault("current_index", 0)
-    st.session_state.setdefault("reviewer_name", "")
     known_ids = set(df["row_id"].tolist())
     st.session_state.annotations = {
         key: value for key, value in st.session_state.annotations.items() if key in known_ids
     }
 
 
-def pretty_dimension(benchmark: str) -> str:
-    return DIMENSION_LABELS.get(str(benchmark), str(benchmark))
+def pretty_benchmark(benchmark: str) -> str:
+    return BENCHMARK_LABELS.get(str(benchmark), str(benchmark))
 
 
-def guidance_for(benchmark: str) -> dict:
+def guidance_for(benchmark: str) -> dict[str, Any]:
     return TASK_GUIDANCE.get(
         benchmark,
         {
             "title": "任务说明",
             "goal": "请根据给定信息，选择你认为最合适的推荐对象。",
-            "basis": ["请按照真实教学推荐习惯进行判断。"],
+            "basis": ["请按真实教学推荐习惯进行判断。"],
         },
     )
 
 
-def load_json_items(value: Any) -> list[dict]:
+def is_blank(value: Any) -> bool:
+    if value is None:
+        return True
     text = str(value).strip()
-    if not text or text.lower() == "nan":
-        return []
+    return text == "" or text.lower() == "nan"
+
+
+def parse_json_value(value: Any) -> Any:
+    if is_blank(value):
+        return ""
+    if isinstance(value, (list, dict)):
+        return value
     try:
-        parsed = json.loads(text)
+        return json.loads(str(value))
     except json.JSONDecodeError:
-        return []
+        return ""
+
+
+def parse_json_list(value: Any) -> list[dict[str, Any]]:
+    parsed = parse_json_value(value)
     return parsed if isinstance(parsed, list) else []
 
 
-def parse_prefixed_lines(text: Any) -> list[tuple[str, str]]:
-    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
-    parsed: list[tuple[str, str]] = []
-    for line in lines:
-        prefix, body = "", line
-        if ":" in line:
-            prefix, body = line.split(":", 1)
-        elif "：" in line:
-            prefix, body = line.split("：", 1)
-        parsed.append((prefix.strip(), body.strip()))
-    return parsed
+def parse_json_dict(value: Any) -> dict[str, Any]:
+    parsed = parse_json_value(value)
+    return parsed if isinstance(parsed, dict) else {}
 
 
-def build_history_items(text: Any) -> list[dict]:
-    items = []
-    for idx, (_, body) in enumerate(parse_prefixed_lines(text), start=1):
-        items.append({"index": idx, "score": "", "total": "", "question_text": body})
-    return items
+def text_or_empty(value: Any) -> str:
+    return "" if is_blank(value) else str(value)
 
 
-def build_blind_candidates(text: Any) -> list[dict]:
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    candidates: list[dict] = []
-    for idx, (_, body) in enumerate(parse_prefixed_lines(text)):
-        label = letters[idx] if idx < len(letters) else f"Option-{idx + 1}"
-        candidates.append({"label": label, "text": body, "qid": "", "is_gt": False})
-    return candidates
+def html_text(text: Any) -> str:
+    content = text_or_empty(text)
+    escaped = html.escape(content, quote=False).replace("\r\n", "\n").replace("\r", "\n")
+    return escaped.replace("\n", "<br>")
 
 
-def _find_matching_brace(text: str, open_pos: int) -> int:
-    depth = 0
-    for i in range(open_pos, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return i
-    return -1
+def compact_items_meta(item: dict[str, Any]) -> str:
+    meta_parts: list[str] = []
+    qid = text_or_empty(item.get("qid"))
+    if qid:
+        meta_parts.append(qid)
+    score = text_or_empty(item.get("score"))
+    total = text_or_empty(item.get("total"))
+    if score or total:
+        meta_parts.append(f"得分 {score}/{total}")
+    chapter = text_or_empty(item.get("chapter"))
+    if chapter:
+        meta_parts.append(f"章节 {chapter}")
+    knowledge_points = item.get("knowledge_points")
+    if isinstance(knowledge_points, list) and knowledge_points:
+        meta_parts.append("知识点：" + "；".join(str(x) for x in knowledge_points))
+    return " | ".join(meta_parts)
 
 
-def _replace_command_two_args(text: str, command: str, renderer) -> str:
-    out: list[str] = []
-    i = 0
-    needle = "\\" + command
-    while i < len(text):
-        if not text.startswith(needle, i):
-            out.append(text[i])
-            i += 1
-            continue
-        j = i + len(needle)
-        while j < len(text) and text[j].isspace():
-            j += 1
-        if j >= len(text) or text[j] != "{":
-            out.append(text[i])
-            i += 1
-            continue
-        end1 = _find_matching_brace(text, j)
-        if end1 < 0:
-            out.append(text[i])
-            i += 1
-            continue
-        k = end1 + 1
-        while k < len(text) and text[k].isspace():
-            k += 1
-        if k >= len(text) or text[k] != "{":
-            out.append(text[i])
-            i += 1
-            continue
-        end2 = _find_matching_brace(text, k)
-        if end2 < 0:
-            out.append(text[i])
-            i += 1
-            continue
-        a = text[j + 1 : end1]
-        b = text[k + 1 : end2]
-        out.append(renderer(a, b))
-        i = end2 + 1
-    return "".join(out)
-
-
-def _replace_command_one_arg(text: str, command: str, renderer) -> str:
-    out: list[str] = []
-    i = 0
-    needle = "\\" + command
-    while i < len(text):
-        if not text.startswith(needle, i):
-            out.append(text[i])
-            i += 1
-            continue
-        j = i + len(needle)
-        while j < len(text) and text[j].isspace():
-            j += 1
-        if j >= len(text) or text[j] != "{":
-            out.append(text[i])
-            i += 1
-            continue
-        end = _find_matching_brace(text, j)
-        if end < 0:
-            out.append(text[i])
-            i += 1
-            continue
-        a = text[j + 1 : end]
-        out.append(renderer(a))
-        i = end + 1
-    return "".join(out)
-
-
-def _simple_math_escape(s: str) -> str:
-    return html.escape(latex_to_readable_text(s), quote=False)
-
-
-def latex_to_readable_text(raw: Any) -> str:
-    """把本题库常见的裸 LaTeX 转成中文题面可读文本。
-
-    关键点：不要求源文本给 $...$，所以比 MathJax 自动识别更稳。
-    """
-    s = "" if raw is None else str(raw)
-    if s.lower() == "nan":
-        return ""
-
-    # 先处理带参数命令。
-    s = _replace_command_two_args(
-        s,
-        "dfrac",
-        lambda a, b: f"⟦FRAC:{_simple_math_escape(a)}|{_simple_math_escape(b)}⟧",
-    )
-    s = _replace_command_two_args(
-        s,
-        "frac",
-        lambda a, b: f"⟦FRAC:{_simple_math_escape(a)}|{_simple_math_escape(b)}⟧",
-    )
-    s = _replace_command_one_arg(s, "sqrt", lambda a: f"√({_simple_math_escape(a)})")
-    s = _replace_command_one_arg(s, "boldsymbol", lambda a: latex_to_readable_text(a))
-    s = _replace_command_one_arg(s, "mathrm", lambda a: latex_to_readable_text(a))
-    s = _replace_command_one_arg(s, "rm", lambda a: latex_to_readable_text(a))
-    s = _replace_command_one_arg(s, "text", lambda a: latex_to_readable_text(a))
-    s = _replace_command_one_arg(s, "overline", lambda a: f"{latex_to_readable_text(a)}̅")
-    s = _replace_command_one_arg(s, "overparen", lambda a: f"⌒{latex_to_readable_text(a)}")
-
-    replacements = {
-        r"\vartriangle": "△",
-        r"\triangle": "△",
-        r"\angle": "∠",
-        r"\bot": "⊥",
-        r"\perp": "⊥",
-        r"\/\!\/": "∥",
-        r"/\!/": "∥",
-        r"\parallel": "∥",
-        r"\times": "×",
-        r"\div": "÷",
-        r"\cdot": "·",
-        r"\boldsymbol{⋅}": "·",
-        r"\circ": "°",
-        r"\alpha": "α",
-        r"\beta": "β",
-        r"\gamma": "γ",
-        r"\theta": "θ",
-        r"\pi": "π",
-        r"\odot": "⊙",
-        r"\leqslant": "≤",
-        r"\leq": "≤",
-        r"\geqslant": "≥",
-        r"\geq": "≥",
-        r"\neq": "≠",
-        r"\sim": "∼",
-        r"\infty": "∞",
-        r"\cdots": "⋯",
-        r"\dots": "…",
-        r"\quad": "　",
-        r"\left": "",
-        r"\right": "",
-        r"\blacksquare": "■",
-        r"\square": "□",
-        r"\#": "#",
-        r"\\": "",
-    }
-    for old, new in replacements.items():
-        s = s.replace(old, new)
-
-    # {^\circ} / {^\circ} 这类先转成 °。
-    s = re.sub(r"\{\s*\^\s*°\s*\}", "°", s)
-    s = re.sub(r"\^\s*\{\s*°\s*\}", "°", s)
-
-    # 常见大括号只是 LaTeX 分组：{a^2} -> a^2，{\left(...\right)^2} -> (... )^2。
-    s = re.sub(r"\{([A-Za-z0-9+\-*/=<>≤≥.,，。:：_()（）\[\]αβγθπ°| ]{1,60})\}", r"\1", s)
-
-    # 上下标。复杂内容用括号显示，简单数字/字母用 unicode。
-    def sup_repl(m: re.Match) -> str:
-        body = m.group(1) or m.group(2)
-        body = latex_to_readable_text(body)
-        if re.fullmatch(r"[0-9+\-=()nix]+", body):
-            return body.translate(SUPERSCRIPT)
-        return f"<sup>{html.escape(body)}</sup>"
-
-    def sub_repl(m: re.Match) -> str:
-        body = m.group(1) or m.group(2)
-        body = latex_to_readable_text(body)
-        if re.fullmatch(r"[0-9+\-=()nix]+", body):
-            return body.translate(SUBSCRIPT)
-        return f"<sub>{html.escape(body)}</sub>"
-
-    s = re.sub(r"\^\{([^{}]{1,40})\}|\^([A-Za-z0-9+\-=()])", sup_repl, s)
-    s = re.sub(r"_\{([^{}]{1,40})\}|_([A-Za-z0-9+\-=()])", sub_repl, s)
-
-    # 处理残留的 LaTeX 转义命令，避免页面上出现反斜杠。
-    s = re.sub(r"\\([A-Za-z]+)", r"\1", s)
-    s = s.replace("{", "").replace("}", "")
-    return s
-
-
-def question_to_html(raw: Any) -> str:
-    key = str(raw)
-    if key in RENDER_CACHE:
-        return RENDER_CACHE[key]
-
-    converted = latex_to_readable_text(raw)
-    # 不能整体 escape，因为上面可能插入 <sup>/<sub> 和 FRAC token；先保护 token。
-    converted = converted.replace("\r\n", "\n").replace("\r", "\n")
-    placeholders: dict[str, str] = {}
-
-    def protect_frac(m: re.Match) -> str:
-        token = f"@@FRAC{len(placeholders)}@@"
-        num, den = m.group(1), m.group(2)
-        placeholders[token] = (
-            '<span class="frac"><span class="num">'
-            + num
-            + '</span><span class="den">'
-            + den
-            + '</span></span>'
-        )
-        return token
-
-    converted = re.sub(r"⟦FRAC:(.*?)\|(.*?)⟧", protect_frac, converted)
-
-    # 保护允许的 sup/sub 标签。
-    def protect_tag(m: re.Match) -> str:
-        token = f"@@TAG{len(placeholders)}@@"
-        placeholders[token] = m.group(0)
-        return token
-
-    converted = re.sub(r"</?(?:sup|sub)>", protect_tag, converted)
-    escaped = html.escape(converted, quote=False)
-    escaped = escaped.replace("\n", "<br>")
-    for token, value in placeholders.items():
-        escaped = escaped.replace(token, value)
-
-    # 选择题选项稍微拉开：A. / B. / C. / D. 单独高亮。
-    escaped = re.sub(
-        r"(?<![A-Za-z])([ABCD])\.",
-        r'<span class="option-mark">\1.</span>',
-        escaped,
-    )
-    RENDER_CACHE[key] = escaped
-    return escaped
-
-
-def enumerate_render_cache(df: pd.DataFrame) -> None:
-    texts: list[str] = []
-    for col in ["gt_signal", "gt_candidate_text", "history_preview", "candidate_preview"]:
-        if col in df.columns:
-            texts.extend(str(x) for x in df[col].dropna().tolist())
-    for col in ["history_items_json", "candidate_items_json"]:
-        if col not in df.columns:
-            continue
-        for value in df[col].dropna().tolist():
-            for item in load_json_items(value):
-                text = item.get("question_text")
-                if text:
-                    texts.append(str(text))
-    for text in dict.fromkeys(texts):
-        question_to_html(text)
-
-
-def card_html(title: str, body_html: str, meta: str = "", kind: str = "normal", badge: str = "") -> str:
-    badge_html = f'<span class="badge">{html.escape(badge)}</span>' if badge else ""
-    meta_html = f'<span class="meta">{html.escape(meta)}</span>' if meta else ""
+def card_html(title: str, body_html: str, meta: str = "", badge: str = "", kind: str = "normal") -> str:
+    badge_html = f"<span class='badge'>{html.escape(badge)}</span>" if badge else ""
+    meta_html = f"<span class='meta'>{html.escape(meta)}</span>" if meta else ""
     return f"""
-    <section class="q-card {kind}">
-      <div class="q-head">
-        <div>{badge_html}<span class="q-title">{html.escape(title)}</span></div>
+    <section class="card {kind}">
+      <div class="card-head">
+        <div class="card-title">{badge_html}{html.escape(title)}</div>
         {meta_html}
       </div>
-      <div class="q-body">{body_html}</div>
+      <div class="card-body">{body_html}</div>
     </section>
     """
+
+
+def section_title_html(title: str) -> str:
+    return f"<div class='section-title'>{html.escape(title)}</div>"
 
 
 def page_css() -> str:
@@ -430,66 +196,107 @@ def page_css() -> str:
       body {
         margin: 0;
         background: #f8fafc;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
         color: #0f172a;
+        font-family: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
-      .wrap { padding: 4px 2px 18px; }
+      .wrap { padding: 8px 4px 18px; }
       .guide {
         border: 1px solid #dbeafe;
         background: linear-gradient(180deg, #eff6ff 0%, #ffffff 100%);
         border-radius: 16px;
         padding: 14px 16px;
-        margin-bottom: 14px;
+        margin-bottom: 16px;
       }
-      .guide h3 { margin: 0 0 8px; font-size: 19px; }
-      .guide p { margin: 4px 0; line-height: 1.72; }
-      .guide ul { margin: 7px 0 0 22px; padding: 0; line-height: 1.7; }
+      .guide h3 {
+        margin: 0 0 8px;
+        font-size: 20px;
+      }
+      .guide p {
+        margin: 5px 0;
+        line-height: 1.8;
+        font-size: 16px;
+      }
+      .guide ul {
+        margin: 8px 0 0 20px;
+        padding: 0;
+        line-height: 1.8;
+        font-size: 15px;
+      }
+      .context-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+        margin-top: 12px;
+      }
+      .context-box {
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        background: #ffffff;
+        padding: 10px 12px;
+      }
+      .context-box .label {
+        display: block;
+        color: #475569;
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 5px;
+      }
+      .context-box .value {
+        font-size: 15px;
+        line-height: 1.8;
+      }
       .section-title {
+        margin: 18px 0 10px;
         font-size: 19px;
         font-weight: 800;
-        margin: 18px 0 10px;
-        display: flex;
-        align-items: center;
-        gap: 8px;
+        color: #0f172a;
+        border-left: 5px solid #2563eb;
+        padding-left: 10px;
       }
-      .section-title:before {
-        content: "";
-        display: inline-block;
-        width: 5px;
-        height: 18px;
-        border-radius: 999px;
-        background: #2563eb;
-      }
-      .q-card {
+      .card {
         border: 1px solid #e5e7eb;
-        border-radius: 17px;
+        border-radius: 16px;
         background: #ffffff;
         padding: 13px 15px 14px;
         margin: 10px 0;
         box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
       }
-      .q-card.history { border-left: 5px solid #94a3b8; }
-      .q-card.candidate { border-left: 5px solid #2563eb; }
-      .q-head {
+      .card.history { border-left: 5px solid #94a3b8; }
+      .card.candidate { border-left: 5px solid #2563eb; }
+      .card.target { border-left: 5px solid #0f766e; }
+      .card.entity { border-left: 5px solid #7c3aed; }
+      .card.member-history { border-left: 4px solid #c4b5fd; background: #faf5ff; }
+      .card-head {
         display: flex;
         justify-content: space-between;
-        align-items: center;
-        gap: 10px;
+        align-items: flex-start;
+        gap: 12px;
         margin-bottom: 8px;
       }
-      .q-title { font-weight: 800; font-size: 16px; color: #111827; }
+      .card-title {
+        font-size: 16px;
+        font-weight: 800;
+        color: #111827;
+      }
+      .card-body {
+        font-size: 17px;
+        line-height: 1.85;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+        white-space: normal;
+      }
       .badge {
         display: inline-flex;
         align-items: center;
         justify-content: center;
         min-width: 26px;
         height: 26px;
-        margin-right: 8px;
         padding: 0 8px;
+        margin-right: 8px;
         border-radius: 999px;
         background: #2563eb;
-        color: white;
-        font-weight: 900;
+        color: #ffffff;
+        font-weight: 800;
         font-size: 14px;
       }
       .meta {
@@ -498,50 +305,59 @@ def page_css() -> str:
         background: #f1f5f9;
         border-radius: 999px;
         padding: 3px 9px;
-        font-size: 13px;
+        font-size: 12px;
+        line-height: 1.5;
       }
-      .q-body {
-        font-size: 18px;
-        line-height: 1.86;
-        letter-spacing: 0.01em;
-        word-break: break-word;
-        overflow-wrap: anywhere;
+      .subtle {
+        color: #475569;
+        font-size: 15px;
       }
-      .frac {
-        display: inline-grid;
-        grid-template-rows: auto auto;
-        align-items: center;
-        justify-items: center;
-        vertical-align: middle;
-        margin: 0 0.12em;
-        line-height: 1.05;
-        font-size: 0.94em;
+      .history-group {
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px dashed #d8b4fe;
       }
-      .frac .num {
-        border-bottom: 1.5px solid currentColor;
-        padding: 0 0.22em 0.08em;
-      }
-      .frac .den { padding: 0.08em 0.22em 0; }
-      sup, sub { line-height: 0; font-size: 0.72em; }
-      .option-mark {
-        display: inline-block;
-        margin-left: 0.55em;
-        margin-right: 0.1em;
-        padding: 0 0.28em;
-        border-radius: 6px;
-        background: #eef2ff;
-        color: #3730a3;
-        font-weight: 800;
+      .history-group:first-of-type {
+        margin-top: 0;
+        padding-top: 0;
+        border-top: none;
       }
     </style>
     """
 
 
-def render_html_panel(html_body: str, min_height: int = 560) -> None:
-    # 直接给足高度，避免 iframe 内部出现二级滚动；题目少，宁可页面长一点。
-    height = max(min_height, 220 + html_body.count("q-card") * 170 + html_body.count("<br>") * 18)
+def katex_head() -> str:
+    return """
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+      onload="renderMathInElement(document.body, {
+        delimiters: [
+          {left: '$$', right: '$$', display: true},
+          {left: '\\\\[', right: '\\\\]', display: true},
+          {left: '\\\\(', right: '\\\\)', display: false}
+        ],
+        throwOnError: false
+      });">
+    </script>
+    """
+
+
+def render_html_panel(html_body: str, min_height: int = 720) -> None:
+    height = max(min_height, 260 + html_body.count("class=\"card") * 150 + html_body.count("<br>") * 12)
     components.html(
-        f"<html><head><meta charset='utf-8'>{page_css()}</head><body><main class='wrap'>{html_body}</main></body></html>",
+        f"""
+        <html>
+          <head>
+            <meta charset="utf-8">
+            {katex_head()}
+            {page_css()}
+          </head>
+          <body>
+            <main class="wrap">{html_body}</main>
+          </body>
+        </html>
+        """,
         height=height,
         scrolling=False,
     )
@@ -549,99 +365,220 @@ def render_html_panel(html_body: str, min_height: int = 560) -> None:
 
 def get_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.header("筛选")
-    dimension_options = ["全部"] + [pretty_dimension(x) for x in sorted(df["benchmark"].dropna().unique().tolist())]
-    selected_dimension = st.sidebar.selectbox("维度", dimension_options)
-    out = df
-    if selected_dimension != "全部":
-        reverse_map = {pretty_dimension(x): x for x in df["benchmark"].dropna().unique().tolist()}
-        out = out[out["benchmark"] == reverse_map[selected_dimension]]
-    return out.reset_index(drop=True)
+    benchmark_values = sorted(df["benchmark"].dropna().unique().tolist())
+    benchmark_options = ["全部"] + [pretty_benchmark(x) for x in benchmark_values]
+    selected_benchmark = st.sidebar.selectbox("维度", benchmark_options)
+
+    case_type_options = ["全部"] + sorted(df["case_type"].dropna().unique().tolist())
+    selected_case_type = st.sidebar.selectbox("样本类型", case_type_options)
+
+    filtered = df
+    if selected_benchmark != "全部":
+        reverse_map = {pretty_benchmark(x): x for x in benchmark_values}
+        filtered = filtered[filtered["benchmark"] == reverse_map[selected_benchmark]]
+    if selected_case_type != "全部":
+        filtered = filtered[filtered["case_type"] == selected_case_type]
+    return filtered.reset_index(drop=True)
 
 
-def context_text(row: pd.Series) -> str:
-    benchmark = str(row.get("benchmark", ""))
-    if benchmark == "Planning_Target":
-        goal = str(row.get("gt_signal", "")).strip()
-        if goal and goal.lower() != "nan":
-            return goal
-    return ""
+def build_context_blocks(row: pd.Series) -> list[tuple[str, str]]:
+    blocks: list[tuple[str, str]] = []
+    if text_or_empty(row.get("learning_goal")):
+        blocks.append(("学习目标", text_or_empty(row.get("learning_goal"))))
+    if text_or_empty(row.get("progress_state")):
+        blocks.append(("学习进度状态", text_or_empty(row.get("progress_state"))))
+    if text_or_empty(row.get("weak_knowledge_points")):
+        blocks.append(("薄弱知识点", text_or_empty(row.get("weak_knowledge_points"))))
+    if text_or_empty(row.get("stage_knowledge_points")):
+        blocks.append(("阶段信息", text_or_empty(row.get("stage_knowledge_points"))))
+    if text_or_empty(row.get("teacher_check_focus")):
+        blocks.append(("核验重点", text_or_empty(row.get("teacher_check_focus"))))
+    return blocks
 
 
-def get_history_items(row: pd.Series) -> list[dict]:
-    items = load_json_items(row.get("history_items_json", ""))
-    if items:
-        return items
-    return build_history_items(row.get("history_preview", ""))
+def get_history_items(row: pd.Series) -> list[dict[str, Any]]:
+    return parse_json_list(row.get("history_items_json", ""))
 
 
-def get_candidates(row: pd.Series) -> list[dict]:
-    raw_candidates = load_json_items(row.get("candidate_items_json", ""))
-    if raw_candidates:
-        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        return [
+def get_question_candidates(row: pd.Series) -> list[dict[str, Any]]:
+    candidates = parse_json_list(row.get("candidate_items_json", ""))
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(candidates):
+        normalized.append(
             {
-                "label": letters[idx] if idx < len(letters) else f"Option-{idx + 1}",
-                "text": str(item.get("question_text", "")),
-                "qid": str(item.get("qid", "")),
-                # 保留在导出，不展示在界面。
-                "is_gt": bool(item.get("is_gt", False)),
+                "label": text_or_empty(item.get("label")) or chr(ord("A") + idx),
+                "display_index": item.get("display_index", idx + 1),
+                "qid": text_or_empty(item.get("qid")),
+                "question_text": text_or_empty(item.get("question_text")),
+                "knowledge_points": item.get("knowledge_points", []),
+                "chapter": text_or_empty(item.get("chapter")),
             }
-            for idx, item in enumerate(raw_candidates)
-        ]
-    return build_blind_candidates(row.get("candidate_preview", ""))
+        )
+    return normalized
 
 
-def build_question_panel(row: pd.Series, candidates: list[dict]) -> str:
+def get_target_question(row: pd.Series) -> dict[str, Any]:
+    return parse_json_dict(row.get("target_question_json", ""))
+
+
+def get_entity_candidates(row: pd.Series) -> list[dict[str, Any]]:
+    entities = parse_json_list(row.get("candidate_entities_json", ""))
+    normalized: list[dict[str, Any]] = []
+    for idx, entity in enumerate(entities):
+        normalized.append(
+            {
+                "label": text_or_empty(entity.get("label")) or chr(ord("A") + idx),
+                "entity_id": text_or_empty(entity.get("entity_id")),
+                "entity_type": text_or_empty(entity.get("entity_type")),
+                "title": text_or_empty(entity.get("title")) or f"候选对象 {idx + 1}",
+                "summary": text_or_empty(entity.get("summary")),
+                "members": entity.get("members", []),
+                "history_items": entity.get("history_items", []),
+            }
+        )
+    return normalized
+
+
+def build_guide_html(row: pd.Series) -> str:
     benchmark = str(row.get("benchmark", ""))
     guide = guidance_for(benchmark)
+    blocks = build_context_blocks(row)
     body = [
         "<div class='guide'>",
-        f"<h3>{html.escape(pretty_dimension(benchmark))}</h3>",
+        f"<h3>{html.escape(pretty_benchmark(benchmark))}</h3>",
         f"<p><b>{html.escape(guide['title'])}</b>：{html.escape(guide['goal'])}</p>",
         "<ul>",
     ]
     for item in guide["basis"]:
         body.append(f"<li>{html.escape(item)}</li>")
     body.append("</ul>")
-    extra = context_text(row)
-    if extra:
-        hint = VISIBLE_CONTEXT_HINT.get(benchmark, "补充信息")
-        body.append(f"<p><b>{html.escape(hint)}：</b>{question_to_html(extra)}</p>")
-    focus = str(row.get("teacher_check_focus", "")).strip()
-    if focus and focus.lower() != "nan":
-        body.append(f"<p><b>检查重点：</b>{html.escape(focus)}</p>")
-    body.append("</div>")
-
-    body.append("<div class='section-title'>历史信息</div>")
-    for item in get_history_items(row):
-        idx = item.get("index", "")
-        score = item.get("score", "")
-        total = item.get("total", "")
-        meta = ""
-        if score != "" and total != "":
-            meta = f"得分 {score}/{total}"
-        title = f"历史 {idx}" if idx != "" else "历史"
-        body.append(card_html(title, question_to_html(item.get("question_text", "")), meta=meta, kind="history"))
-
-    body.append("<div class='section-title'>候选项</div>")
-    for candidate in candidates:
-        label = candidate["label"]
-        meta = candidate.get("qid", "")
-        body.append(
-            card_html(
-                f"候选 {label}",
-                question_to_html(candidate.get("text", "")),
-                meta=meta,
-                kind="candidate",
-                badge=label,
+    if blocks:
+        body.append("<div class='context-grid'>")
+        for label, value in blocks:
+            body.append(
+                f"<div class='context-box'><span class='label'>{html.escape(label)}</span>"
+                f"<div class='value'>{html_text(value)}</div></div>"
             )
-        )
+        body.append("</div>")
+    body.append("</div>")
     return "\n".join(body)
 
 
-def default_annotation(row_id: int) -> dict:
+def build_question_task_panel(row: pd.Series) -> str:
+    parts: list[str] = [build_guide_html(row)]
+
+    history_items = get_history_items(row)
+    parts.append(section_title_html("历史题目"))
+    for item in history_items:
+        title = f"历史 {item.get('index', '')}".strip()
+        parts.append(
+            card_html(
+                title=title or "历史题目",
+                body_html=html_text(item.get("question_text", "")),
+                meta=compact_items_meta(item),
+                kind="history",
+            )
+        )
+
+    candidates = get_question_candidates(row)
+    parts.append(section_title_html("候选题目"))
+    for item in candidates:
+        parts.append(
+            card_html(
+                title=f"候选题 {item['label']}",
+                body_html=html_text(item.get("question_text", "")),
+                meta=compact_items_meta(item),
+                badge=item["label"],
+                kind="candidate",
+            )
+        )
+    return "\n".join(parts)
+
+
+def build_entity_history_html(entity: dict[str, Any]) -> str:
+    history_items = entity.get("history_items", [])
+    if not isinstance(history_items, list) or not history_items:
+        return "<div class='subtle'>未提供结构化历史记录。</div>"
+
+    if entity.get("entity_type") == "group":
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in history_items:
+            member_label = text_or_empty(item.get("member_label")) or "成员"
+            grouped.setdefault(member_label, []).append(item)
+        sections: list[str] = []
+        for member_label, items in grouped.items():
+            member_lines = [f"<div class='history-group'><div class='subtle'><b>成员 {html.escape(member_label)}</b></div>"]
+            for history_item in items:
+                meta = compact_items_meta(history_item)
+                body = html_text(history_item.get("question_text", ""))
+                member_lines.append(
+                    f"<div class='subtle' style='margin-top:6px;'><b>历史 {html.escape(str(history_item.get('index', '')))}</b>"
+                    f"{'｜' + html.escape(meta) if meta else ''}</div>"
+                )
+                member_lines.append(f"<div>{body}</div>")
+            member_lines.append("</div>")
+            sections.append("".join(member_lines))
+        return "".join(sections)
+
+    lines: list[str] = []
+    for history_item in history_items:
+        meta = compact_items_meta(history_item)
+        lines.append(
+            f"<div class='subtle' style='margin-top:8px;'><b>历史 {html.escape(str(history_item.get('index', '')))}</b>"
+            f"{'｜' + html.escape(meta) if meta else ''}</div>"
+        )
+        lines.append(f"<div>{html_text(history_item.get('question_text', ''))}</div>")
+    return "".join(lines)
+
+
+def build_entity_task_panel(row: pd.Series) -> str:
+    parts: list[str] = [build_guide_html(row)]
+
+    target_question = get_target_question(row)
+    parts.append(section_title_html("目标题目"))
+    parts.append(
+        card_html(
+            title="目标题目",
+            body_html=html_text(target_question.get("question_text", row.get("target_question_text", ""))),
+            meta=compact_items_meta(target_question),
+            kind="target",
+        )
+    )
+
+    parts.append(section_title_html("候选对象"))
+    entities = get_entity_candidates(row)
+    for entity in entities:
+        members = entity.get("members", [])
+        meta_parts = []
+        if entity.get("entity_id"):
+            meta_parts.append(entity["entity_id"])
+        if isinstance(members, list) and members:
+            meta_parts.append("成员：" + "、".join(str(x) for x in members))
+        summary_block = ""
+        if entity.get("summary"):
+            summary_block = f"<div style='margin-bottom:10px;'>{html_text(entity['summary'])}</div>"
+        body_html = summary_block + build_entity_history_html(entity)
+        parts.append(
+            card_html(
+                title=entity.get("title", f"候选对象 {entity['label']}"),
+                body_html=body_html,
+                meta=" | ".join(meta_parts),
+                badge=entity["label"],
+                kind="entity",
+            )
+        )
+    return "\n".join(parts)
+
+
+def build_main_panel(row: pd.Series) -> str:
+    task_type = str(row.get("task_type", ""))
+    if task_type == "entity_recommendation":
+        return build_entity_task_panel(row)
+    return build_question_task_panel(row)
+
+
+def default_annotation() -> dict[str, Any]:
     return {
-        "reviewer_name": st.session_state.reviewer_name,
         "teacher_choice_label": "",
         "teacher_choice_text": "",
         "teacher_confidence": 3,
@@ -650,57 +587,66 @@ def default_annotation(row_id: int) -> dict:
     }
 
 
-def get_annotation(row_id: int) -> dict:
-    return st.session_state.annotations.get(row_id, default_annotation(row_id))
+def get_annotation(row_id: str) -> dict[str, Any]:
+    return st.session_state.annotations.get(row_id, default_annotation())
 
 
-def set_annotation(row_id: int, payload: dict) -> None:
+def set_annotation(row_id: str, payload: dict[str, Any]) -> None:
     st.session_state.annotations[row_id] = payload
 
 
-def render_annotation_form(row: pd.Series, candidates: list[dict]) -> None:
-    row_id = int(row["row_id"])
+def choice_options_for_row(row: pd.Series) -> list[tuple[str, str]]:
+    task_type = str(row.get("task_type", ""))
+    if task_type == "entity_recommendation":
+        entities = get_entity_candidates(row)
+        return [(item["label"], item.get("title", item["label"])) for item in entities]
+    candidates = get_question_candidates(row)
+    return [(item["label"], item.get("question_text", "")) for item in candidates]
+
+
+def render_annotation_form(row: pd.Series) -> None:
+    row_id = str(row["row_id"])
     default = get_annotation(row_id)
-    label_to_text = {item["label"]: item["text"] for item in candidates}
-    choice_labels = [""] + [item["label"] for item in candidates] + ["无法判断 / 暂不推荐"]
+    options = choice_options_for_row(row)
+    labels = [""] + [label for label, _ in options] + ["无法判断 / 暂不推荐"]
+    label_to_text = {label: text for label, text in options}
 
     st.subheader("教师推荐标注")
-    # reviewer_name = st.text_input("标注人", value=default["reviewer_name"] or st.session_state.reviewer_name)
-    # st.session_state.reviewer_name = reviewer_name
-
     selected_label = st.radio(
-        "请选择你会推荐的候选项",
-        options=choice_labels,
-        index=choice_labels.index(default["teacher_choice_label"])
-        if default["teacher_choice_label"] in choice_labels
-        else 0,
-        format_func=lambda x: "请选择" if x == "" else x,
+        "请选择你会推荐的对象",
+        options=labels,
+        index=labels.index(default["teacher_choice_label"]) if default["teacher_choice_label"] in labels else 0,
+        format_func=lambda value: "请选择" if value == "" else value,
         horizontal=True,
     )
+
     if selected_label and selected_label in label_to_text:
-        with st.expander(f"已选候选 {selected_label} 预览", expanded=True):
-            components.html(
-                f"<html><head><meta charset='utf-8'>{page_css()}</head><body><div class='q-body'>{question_to_html(label_to_text[selected_label])}</div></body></html>",
-                height=220,
-                scrolling=True,
-            )
+        st.caption("当前选择预览")
+        st.markdown(
+            f"""
+            <div style="border:1px solid #dbeafe;border-radius:14px;padding:12px 14px;background:#f8fbff;line-height:1.8;">
+              <b>{html.escape(selected_label)}</b><br>
+              {html_text(label_to_text[selected_label])}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     teacher_confidence = st.slider("推荐把握度", 1, 5, int(default["teacher_confidence"]))
     teacher_reason = st.text_area(
         "推荐理由",
         value=default["teacher_reason"],
-        height=150,
-        placeholder="请说明你为什么会推荐这个候选项。",
+        height=160,
+        placeholder="请说明你为什么会推荐这个对象。",
     )
     teacher_comment = st.text_area(
         "补充备注",
         value=default["teacher_comment"],
         height=120,
-        placeholder="可记录歧义、样本问题、其他备选意见等。",
+        placeholder="可记录歧义、数据问题、其他候选意见等。",
     )
 
     payload = {
-        # "reviewer_name": reviewer_name,
         "teacher_choice_label": selected_label,
         "teacher_choice_text": label_to_text.get(selected_label, selected_label),
         "teacher_confidence": teacher_confidence,
@@ -736,11 +682,9 @@ def build_export_df(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def save_local_annotations(export_df: pd.DataFrame, reviewer_name: str) -> Path:
+def save_local_annotations(export_df: pd.DataFrame) -> Path:
     ANNOTATION_DIR.mkdir(parents=True, exist_ok=True)
-    safe_name = reviewer_name.strip() or "anonymous"
-    safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in safe_name)
-    path = ANNOTATION_DIR / f"{safe_name}_annotations.csv"
+    path = ANNOTATION_DIR / "teacher_annotations_latest.csv"
     export_df.to_csv(path, index=False, encoding="utf-8-sig")
     return path
 
@@ -749,10 +693,10 @@ def inject_streamlit_css() -> None:
     st.markdown(
         """
         <style>
-          .block-container { padding-top: 1.4rem; padding-bottom: 2rem; max-width: 1480px; }
+          .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1500px; }
           div[data-testid="stVerticalBlock"] { gap: 0.65rem; }
-          section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] { gap: 0.6rem; }
-          .stRadio [role="radiogroup"] { gap: 0.38rem 0.65rem; }
+          section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] { gap: 0.65rem; }
+          .stRadio [role="radiogroup"] { gap: 0.4rem 0.7rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -763,10 +707,8 @@ def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
     inject_streamlit_css()
     st.title("教师推荐标注")
-    # st.caption("已按当前 CSV 穷举预渲染题目文本；裸 LaTeX 会转成可读 HTML，不再依赖题目自带 $...$。")
 
     df = load_samples()
-    enumerate_render_cache(df)
     init_state(df)
     filtered = get_filtered_df(df)
 
@@ -784,7 +726,7 @@ def main() -> None:
         "跳转到样本",
         row_ids,
         index=min(st.session_state.current_index, len(row_ids) - 1),
-        format_func=lambda rid: f"{rid} | {pretty_dimension(filtered[filtered['row_id'] == rid].iloc[0]['benchmark'])}",
+        format_func=lambda rid: f"{rid} | {pretty_benchmark(filtered[filtered['row_id'] == rid].iloc[0]['benchmark'])}",
     )
     st.session_state.current_index = int(filtered.index[filtered["row_id"] == selected_row_id][0])
 
@@ -799,13 +741,12 @@ def main() -> None:
     st.caption(f"样本 {st.session_state.current_index + 1} / {len(filtered)}")
 
     row = filtered.iloc[st.session_state.current_index]
-    candidates = get_candidates(row)
 
-    left, right = st.columns([1.55, 1.0], gap="large")
+    left, right = st.columns([1.7, 1.0], gap="large")
     with left:
-        render_html_panel(build_question_panel(row, candidates))
+        render_html_panel(build_main_panel(row))
     with right:
-        render_annotation_form(row, candidates)
+        render_annotation_form(row)
 
     st.divider()
     export_df = build_export_df(df)
@@ -819,7 +760,7 @@ def main() -> None:
         mime="text/csv",
     )
     if st.button("保存到本地文件"):
-        path = save_local_annotations(export_df, st.session_state.reviewer_name)
+        path = save_local_annotations(export_df)
         st.success(f"已保存到 {path}")
     with st.expander("当前会话标注预览", expanded=False):
         st.dataframe(export_df, use_container_width=True)
