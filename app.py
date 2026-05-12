@@ -535,7 +535,7 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
 def init_state(df: pd.DataFrame) -> None:
     st.session_state.setdefault("annotations", {})
     st.session_state.setdefault("current_index", 0)
-    valid = set(map(int, df["row_id"].tolist()))
+    valid = set(df["row_id"].astype(str).tolist())
     st.session_state.annotations = {int(k): v for k, v in st.session_state.annotations.items() if int(k) in valid}
 
 
