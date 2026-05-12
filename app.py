@@ -181,7 +181,43 @@ def _brace_end(s: str, start: int) -> int:
     return -1
 
 
+
+def _simple_arg_end(s: str, start: int) -> int:
+    """Return end position for a simple unbraced LaTeX argument such as 2, x, AB, or (x+1).
+
+    This is not a fallback-to-run mechanism; it is part of the renderer grammar because the
+    dataset contains both \sqrt{2} and \sqrt2 / \sqrt 2 style text.
+    """
+    j = start
+    while j < len(s) and s[j].isspace():
+        j += 1
+    if j >= len(s):
+        return j
+    if s[j] in "([|":
+        pairs = {"(": ")", "[": "]", "|": "|"}
+        close = pairs[s[j]]
+        k = j + 1
+        while k < len(s):
+            if s[k] == close:
+                return k + 1
+            k += 1
+        return j + 1
+    if s[j].isalnum() or s[j] in "+-=.°παβγθ":
+        k = j + 1
+        while k < len(s) and (s[k].isalnum() or s[k] in "+-=.°παβγθ"):
+            k += 1
+        return k
+    return j + 1
+
+
 def _one_arg(s: str, cmd: str, renderer) -> str:
+    """Replace LaTeX command with one argument.
+
+    Supports both braced form (\sqrt{2}) and common compact form (\sqrt2).
+    Unknown or incomplete command is preserved as text instead of raising during rendering.
+    Structural validation belongs to the CSV generator; the app renderer should not crash
+    because one historical question contains informal LaTeX.
+    """
     needle = "\\" + cmd
     out: list[str] = []
     i = 0
@@ -193,15 +229,29 @@ def _one_arg(s: str, cmd: str, renderer) -> str:
         j = i + len(needle)
         while j < len(s) and s[j].isspace():
             j += 1
-        require(j < len(s) and s[j] == "{", f"LaTeX 命令 {needle} 缺少参数：{s}")
-        end = _brace_end(s, j)
-        require(end >= 0, f"LaTeX 命令 {needle} 大括号不闭合：{s}")
-        out.append(renderer(s[j + 1:end]))
-        i = end + 1
+        if j < len(s) and s[j] == "{":
+            end = _brace_end(s, j)
+            if end >= 0:
+                out.append(renderer(s[j + 1:end]))
+                i = end + 1
+                continue
+        # compact form, e.g. \sqrt2. If there is no usable argument, preserve command.
+        end = _simple_arg_end(s, j)
+        if end > j:
+            out.append(renderer(s[j:end]))
+            i = end
+        else:
+            out.append(needle)
+            i = j
     return "".join(out)
 
 
 def _two_args(s: str, cmd: str, renderer) -> str:
+    """Replace LaTeX command with two braced arguments.
+
+    Malformed two-argument commands are preserved so the page remains usable and the
+    problematic text is visible to the annotator instead of crashing the whole app.
+    """
     needle = "\\" + cmd
     out: list[str] = []
     i = 0
@@ -213,15 +263,27 @@ def _two_args(s: str, cmd: str, renderer) -> str:
         j = i + len(needle)
         while j < len(s) and s[j].isspace():
             j += 1
-        require(j < len(s) and s[j] == "{", f"LaTeX 命令 {needle} 缺少第一个参数：{s}")
+        if j >= len(s) or s[j] != "{":
+            out.append(needle)
+            i = j
+            continue
         end1 = _brace_end(s, j)
-        require(end1 >= 0, f"LaTeX 命令 {needle} 第一个参数不闭合：{s}")
+        if end1 < 0:
+            out.append(s[i:j + 1])
+            i = j + 1
+            continue
         k = end1 + 1
         while k < len(s) and s[k].isspace():
             k += 1
-        require(k < len(s) and s[k] == "{", f"LaTeX 命令 {needle} 缺少第二个参数：{s}")
+        if k >= len(s) or s[k] != "{":
+            out.append(s[i:end1 + 1])
+            i = end1 + 1
+            continue
         end2 = _brace_end(s, k)
-        require(end2 >= 0, f"LaTeX 命令 {needle} 第二个参数不闭合：{s}")
+        if end2 < 0:
+            out.append(s[i:k + 1])
+            i = k + 1
+            continue
         out.append(renderer(s[j + 1:end1], s[k + 1:end2]))
         i = end2 + 1
     return "".join(out)
