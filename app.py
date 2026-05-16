@@ -493,7 +493,7 @@ def render_history_score_table(items: list[dict[str, Any]], title: str = "学生
             "<tr>"
             f"<td class='qnum'>Q{html.escape(idx)}</td>"
             f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>"
-            f"<td class='qhint'>{html.escape(short_hint(item.get('question_text', ''), 96))}</td>"
+            f"<td class='qhint'>{qhtml(item.get('question_text', ''))}</td>"
             f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>"
             "</tr>"
         )
@@ -589,7 +589,7 @@ def individual_table(entity: dict[str, Any]) -> str:
             "<tr>"
             f"<td class='qnum'>Q{html.escape(idx)}</td>"
             f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>"
-            f"<td class='qhint'>{html.escape(short_hint(item['question_text'], 90))}</td>"
+            f"<td class='qhint'>{qhtml(item['question_text'])}</td>"
             f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>"
             "</tr>"
         )
@@ -609,7 +609,7 @@ def group_table(entity: dict[str, Any]) -> str:
         cells = [
             f"<td class='qnum'>Q{html.escape(idx)}</td>",
             f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>",
-            f"<td class='qhint'>{html.escape(short_hint(q['question_text'], 82))}</td>",
+            f"<td class='qhint'>{qhtml(q['question_text'])}</td>",
         ]
         for member in members:
             item = lookup.get((member, history_key(q)), {})
@@ -906,8 +906,8 @@ def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
     inject_css()
     st.title("教师推荐标注")
-    st.caption(f"版本：{APP_VERSION}")
-    st.caption("严格版：只读取规范 review_samples.csv；缺字段或字段语义错误会直接报错，不做兼容兜底。")
+    # st.caption(f"版本：{APP_VERSION}")
+    # st.caption("严格版：只读取规范 review_samples.csv；缺字段或字段语义错误会直接报错，不做兼容兜底。")
 
     df = load_samples()
     init_state(df)
