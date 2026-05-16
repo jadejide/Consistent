@@ -446,6 +446,18 @@ def inject_css() -> None:
     .score-partial {background:#fef3c7; color:#92400e;}
     .score-empty {background:#f1f5f9; color:#64748b;}
     .member-total {display:inline-block; margin:4px 6px 4px 0; padding:3px 9px; border-radius:999px; background:#f5f3ff; color:#5b21b6; font-weight:800; font-size:.88rem;}
+    .sample-progress{
+    display:inline-block;
+    margin: 0.2rem 0 0.8rem 0;
+    padding: 8px 16px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #dbeafe 0%, #eff6ff 100%);
+    border: 1px solid #93c5fd;
+    color: #1d4ed8;
+    font-size: 1.08rem;
+    font-weight: 900;
+    box-shadow: 0 1px 2px rgba(15,23,42,.06);
+}
     </style>
     """)
 
@@ -729,7 +741,30 @@ def save_local(export_df: pd.DataFrame) -> Path:
     path = ANNOTATION_DIR / f"teacher_annotations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     export_df.to_csv(path, index=False, encoding="utf-8-sig")
     return path
+def build_export_json(df: pd.DataFrame) -> list[dict[str, Any]]:
+    base = df.set_index("row_id", drop=False).to_dict(orient="index")
+    rows = []
 
+    for row_id, annotation in st.session_state.annotations.items():
+        if row_id not in base:
+            continue
+
+        row = base[row_id]
+
+        rows.append({
+            "row_id": row_id,
+            "sample_id": clean(row.get("sample_id")),
+            "benchmark": clean(row.get("benchmark")),
+            "task_label": clean(row.get("task_label")) or TASK_LABELS.get(clean(row.get("benchmark")), ""),
+            "teacher_choice_label": clean(annotation.get("teacher_choice_label")),
+            "teacher_choice_text": clean(annotation.get("teacher_choice_text")),
+            "teacher_confidence": annotation.get("teacher_confidence"),
+            "teacher_reason": clean(annotation.get("teacher_reason")),
+            "teacher_comment": clean(annotation.get("teacher_comment")),
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    return rows
 
 def score_text(item: dict[str, Any]) -> str:
     score = clean(item.get("score"))
@@ -947,7 +982,9 @@ def main() -> None:
     c3.progress((st.session_state.current_index + 1) / len(filtered))
 
     row = filtered.iloc[st.session_state.current_index]
-    st.caption(f"样本 {st.session_state.current_index + 1} / {len(filtered)} · row_id={clean(row['row_id'])} · sample_id={clean(row['sample_id'])}")
+    html_block(
+    f"<div class='sample-progress'>样本 {st.session_state.current_index + 1} / {len(filtered)}</div>"
+)
 
     left, right = st.columns([1.62, 1], gap="large")
     with left:
@@ -956,20 +993,19 @@ def main() -> None:
         render_form(row, choices, choice_type)
 
     st.divider()
-    export_df = build_export_df(df)
     st.subheader("导出")
-    st.write(f"当前会话已保存标注：{len(export_df)}")
+    
+    export_json = build_export_json(df)
+    
+    st.write(f"当前会话已保存标注：{len(export_json)}")
+    
     st.download_button(
-        "下载标注 CSV",
-        data=export_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig"),
-        file_name="teacher_recommendation_annotations.csv",
-        mime="text/csv",
+        "导出标注 JSON",
+        data=json.dumps(export_json, ensure_ascii=False, indent=2).encode("utf-8"),
+        file_name="teacher_recommendation_annotations.json",
+        mime="application/json",
+        use_container_width=True,
     )
-    if st.button("保存到本地文件"):
-        path = save_local(export_df)
-        st.success(f"已保存到 {path}")
-    with st.expander("当前会话标注预览", expanded=False):
-        st.dataframe(export_df, use_container_width=True)
 
 
 if __name__ == "__main__":
