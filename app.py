@@ -950,6 +950,7 @@ def main() -> None:
     st.sidebar.header("筛选")
     dims = ["全部"] + [TASK_LABELS[x] for x in sorted(df["benchmark"].unique())]
     selected = st.sidebar.selectbox("维度", dims)
+
     if selected == "全部":
         filtered = df.reset_index(drop=True)
     else:
@@ -957,55 +958,86 @@ def main() -> None:
         filtered = df[df["benchmark"] == rev[selected]].reset_index(drop=True)
 
     require(len(filtered) > 0, "当前筛选下没有样本")
-    if st.session_state.current_index >= len(filtered):
-        st.session_state.current_index = 0
 
-    annotated = sum(1 for rid in filtered["row_id"].astype(str) if st.session_state.annotations.get(rid, {}).get("teacher_choice_label"))
+    annotated = sum(
+        1
+        for rid in filtered["row_id"].astype(str)
+        if st.session_state.annotations.get(rid, {}).get("teacher_choice_label")
+    )
     st.sidebar.metric("当前筛选下已标注", f"{annotated}/{len(filtered)}")
 
     row_ids = filtered["row_id"].astype(str).tolist()
-    
+
+    # ============================================================
+    # 稳定样本跳转逻辑：用 current_row_id 作为唯一真实状态
+    # ============================================================
+    if "current_row_id" not in st.session_state:
+        if 0 <= st.session_state.current_index < len(row_ids):
+            st.session_state.current_row_id = row_ids[st.session_state.current_index]
+        else:
+            st.session_state.current_row_id = row_ids[0]
+
+    # 如果切换筛选维度后，当前 row_id 不在新的 filtered 里，则回到当前筛选下第一条
+    if st.session_state.current_row_id not in row_ids:
+        st.session_state.current_row_id = row_ids[0]
+
+    # current_index 只由 current_row_id 推出来
+    st.session_state.current_index = row_ids.index(st.session_state.current_row_id)
+
     def format_sample_option(rid: str) -> str:
         row = filtered[filtered["row_id"].astype(str) == rid].iloc[0]
         benchmark = clean(row["benchmark"])
         idx = row_ids.index(rid) + 1
         return f"样本 {idx}｜{TASK_LABELS.get(benchmark, benchmark)}"
-    
+
     selected_row_id = st.sidebar.selectbox(
         "跳转到样本",
         row_ids,
         index=st.session_state.current_index,
         format_func=format_sample_option,
     )
-    st.session_state.current_index = row_ids.index(selected_row_id)
+
+    # 下拉框选择后，立刻同步 current_row_id
+    if selected_row_id != st.session_state.current_row_id:
+        st.session_state.current_row_id = selected_row_id
+        st.session_state.current_index = row_ids.index(selected_row_id)
+        st.rerun()
 
     c1, c2, c3 = st.columns([1, 1, 4])
+
     if c1.button("上一条", use_container_width=True) and st.session_state.current_index > 0:
         st.session_state.current_index -= 1
+        st.session_state.current_row_id = row_ids[st.session_state.current_index]
         st.rerun()
+
     if c2.button("下一条", use_container_width=True) and st.session_state.current_index < len(filtered) - 1:
         st.session_state.current_index += 1
+        st.session_state.current_row_id = row_ids[st.session_state.current_index]
         st.rerun()
+
     c3.progress((st.session_state.current_index + 1) / len(filtered))
 
-    row = filtered.iloc[st.session_state.current_index]
+    row = filtered[filtered["row_id"].astype(str) == st.session_state.current_row_id].iloc[0]
+
     html_block(
-    f"<div class='sample-progress'>样本 {st.session_state.current_index + 1} / {len(filtered)}</div>"
-)
+        f"<div class='sample-progress'>样本 {st.session_state.current_index + 1} / {len(filtered)}</div>"
+    )
 
     left, right = st.columns([1.62, 1], gap="large")
+
     with left:
         choices, choice_type = render_left(row)
+
     with right:
         render_form(row, choices, choice_type)
 
     st.divider()
     st.subheader("导出")
-    
+
     export_json = build_export_json(df)
-    
+
     st.write(f"当前会话已保存标注：{len(export_json)}")
-    
+
     st.download_button(
         "导出标注 JSON",
         data=json.dumps(export_json, ensure_ascii=False, indent=2).encode("utf-8"),
@@ -1013,7 +1045,6 @@ def main() -> None:
         mime="application/json",
         use_container_width=True,
     )
-
 
 if __name__ == "__main__":
     main()
