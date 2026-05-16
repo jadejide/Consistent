@@ -935,11 +935,7 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
     render_full_history_questions(entities)
     render_entity_candidates(entities, benchmark)
     return entities, "entity"
-def format_sample_option(rid: str) -> str:
-    row = filtered[filtered["row_id"].astype(str) == rid].iloc[0]
-    benchmark = clean(row["benchmark"])
-    idx = row_ids.index(rid) + 1
-    return f"样本 {idx}｜{TASK_LABELS.get(benchmark, benchmark)}"
+
 
 def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
@@ -969,7 +965,11 @@ def main() -> None:
 
     row_ids = filtered["row_id"].astype(str).tolist()
     
-
+    def format_sample_option(rid: str) -> str:
+        row = filtered[filtered["row_id"].astype(str) == rid].iloc[0]
+        benchmark = clean(row["benchmark"])
+        idx = row_ids.index(rid) + 1
+        return f"样本 {idx}｜{TASK_LABELS.get(benchmark, benchmark)}"
     
     selected_row_id = st.sidebar.selectbox(
         "跳转到样本",
