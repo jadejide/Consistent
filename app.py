@@ -513,17 +513,10 @@ def render_history_score_table(items: list[dict[str, Any]], title: str = "学生
     for i, item in enumerate(items, start=1):
         idx = clean(item.get("index")) or str(i)
         qid = clean(item.get("qid"))
-        meta_bits = [qid]
-        cognition_level = clean(item.get("cognition_level"))
-        if cognition_level:
-            meta_bits.append(cognition_level)
-        source_bloom_levels = item.get("source_bloom_levels")
-        if isinstance(source_bloom_levels, list) and source_bloom_levels:
-            meta_bits.append("/".join(clean(x) for x in source_bloom_levels if clean(x)))
         rows.append(
             "<tr>"
             f"<td class='qnum'>Q{html.escape(idx)}</td>"
-            f"<td><span class='meta'>{html.escape(' · '.join(x for x in meta_bits if x) or '—')}</span></td>"
+            f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>"
             f"<td class='qhint'>{qhtml(item.get('question_text', ''))}</td>"
             f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>"
             "</tr>"
@@ -574,20 +567,7 @@ def render_question_candidates(items: list[dict[str, Any]]) -> None:
     for i, item in enumerate(items):
         label = clean(item["label"])
         qid = clean(item.get("qid"))
-        meta_bits = [qid]
-        cognition_level = clean(item.get("cognition_level"))
-        if cognition_level:
-            meta_bits.append(cognition_level)
-        source_bloom_levels = item.get("source_bloom_levels")
-        if isinstance(source_bloom_levels, list) and source_bloom_levels:
-            meta_bits.append("/".join(clean(x) for x in source_bloom_levels if clean(x)))
-        card(
-            f"候选 {label}",
-            item["question_text"],
-            meta=" · ".join(x for x in meta_bits if x),
-            kind="candidate-card",
-            badge=label,
-        )
+        card(f"候选 {label}", item["question_text"], meta=qid, kind="candidate-card", badge=label)
 
 
 def render_full_history_questions(entities: list[dict[str, Any]]) -> None:
@@ -964,13 +944,6 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
 
     if benchmark == "Planning_Target" and clean(row["learning_goal"]):
         card("学习目标", row["learning_goal"], kind="goal-card")
-    if benchmark == "Congnition":
-        if clean(row.get("cognition_target", "")):
-            card("目标认知层级", row["cognition_target"], kind="goal-card")
-        if clean(row.get("cognition_history_summary", "")):
-            card("历史认知分布", row["cognition_history_summary"], kind="goal-card")
-        if clean(row.get("cognition_candidate_summary", "")):
-            card("候选认知分布", row["cognition_candidate_summary"], kind="goal-card")
 
     if benchmark in QUESTION_TASKS:
         history = json_list(row["history_items_json"], "history_items_json", row_id)
