@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 APP_DIR = Path(__file__).resolve().parent
-DATA_DIR = APP_DIR / "data"
+DATA_DIR = APP_DIR
 ANNOTATION_DIR = DATA_DIR / "annotations"
 REVIEW_CSV = DATA_DIR / "review_samples.csv"
 APP_VERSION = "single_history_score_aligned_2026_05_12"
