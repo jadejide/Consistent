@@ -17,7 +17,7 @@ REVIEW_CSV = DATA_DIR / "review_samples.csv"
 APP_VERSION = "single_history_score_aligned_2026_05_12"
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-QUESTION_TASKS = {"KP_Weak", "KP_Stage", "Planning_Progress", "Planning_Target"}
+QUESTION_TASKS = {"KP_Weak", "KP_Stage", "Planning_Progress", "Planning_Target", "Congnition"}
 ENTITY_TASKS = {"Personality_Individual", "Personality_Group"}
 ALL_BENCHMARKS = QUESTION_TASKS | ENTITY_TASKS
 
@@ -26,6 +26,7 @@ TASK_LABELS = {
     "KP_Stage": "知识匹配：教学进度知识匹配",
     "Planning_Progress": "规划适配：学习进程适配",
     "Planning_Target": "规划适配：学习目标适配",
+    "Congnition": "认知契合度：认知层级适配",
     "Personality_Individual": "个性区分：个体区分",
     "Personality_Group": "个性区分：群体区分",
 }
@@ -150,6 +151,8 @@ def validate_dataframe(df: pd.DataFrame) -> None:
                 require(clean(row["learning_goal"]), f"row_id={row_id} Planning_Target 必须有 learning_goal")
             if benchmark == "Planning_Progress":
                 require(clean(row["progress_state"]), f"row_id={row_id} Planning_Progress 必须有 progress_state")
+            if benchmark == "Congnition":
+                require(clean(row.get("cognition_target", "")), f"row_id={row_id} Congnition 必须有 cognition_target")
 
         if benchmark in ENTITY_TASKS:
             require(clean(row["task_type"]) == "entity_recommendation", f"row_id={row_id} task_type 应为 entity_recommendation")
@@ -164,7 +167,16 @@ def validate_dataframe(df: pd.DataFrame) -> None:
                 history = entity.get("history_items")
                 require(isinstance(history, list) and len(history) > 0, f"row_id={row_id} 候选实体 {entity.get('label')} 缺少 history_items")
 
-        for field in ["history_preview", "candidate_preview", "target_question_text", "learning_goal", "progress_state"]:
+        for field in [
+            "history_preview",
+            "candidate_preview",
+            "target_question_text",
+            "learning_goal",
+            "progress_state",
+            "cognition_target",
+            "cognition_history_summary",
+            "cognition_candidate_summary",
+        ]:
             if field in df.columns:
                 text = clean(row.get(field, ""))
                 require("GT:" not in text and "is_gt" not in text and "correct_answer" not in text, f"row_id={row_id} 面向老师字段 {field} 出现泄漏标记")
@@ -501,10 +513,17 @@ def render_history_score_table(items: list[dict[str, Any]], title: str = "学生
     for i, item in enumerate(items, start=1):
         idx = clean(item.get("index")) or str(i)
         qid = clean(item.get("qid"))
+        meta_bits = [qid]
+        cognition_level = clean(item.get("cognition_level"))
+        if cognition_level:
+            meta_bits.append(cognition_level)
+        source_bloom_levels = item.get("source_bloom_levels")
+        if isinstance(source_bloom_levels, list) and source_bloom_levels:
+            meta_bits.append("/".join(clean(x) for x in source_bloom_levels if clean(x)))
         rows.append(
             "<tr>"
             f"<td class='qnum'>Q{html.escape(idx)}</td>"
-            f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>"
+            f"<td><span class='meta'>{html.escape(' · '.join(x for x in meta_bits if x) or '—')}</span></td>"
             f"<td class='qhint'>{qhtml(item.get('question_text', ''))}</td>"
             f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>"
             "</tr>"
@@ -555,7 +574,20 @@ def render_question_candidates(items: list[dict[str, Any]]) -> None:
     for i, item in enumerate(items):
         label = clean(item["label"])
         qid = clean(item.get("qid"))
-        card(f"候选 {label}", item["question_text"], meta=qid, kind="candidate-card", badge=label)
+        meta_bits = [qid]
+        cognition_level = clean(item.get("cognition_level"))
+        if cognition_level:
+            meta_bits.append(cognition_level)
+        source_bloom_levels = item.get("source_bloom_levels")
+        if isinstance(source_bloom_levels, list) and source_bloom_levels:
+            meta_bits.append("/".join(clean(x) for x in source_bloom_levels if clean(x)))
+        card(
+            f"候选 {label}",
+            item["question_text"],
+            meta=" · ".join(x for x in meta_bits if x),
+            kind="candidate-card",
+            badge=label,
+        )
 
 
 def render_full_history_questions(entities: list[dict[str, Any]]) -> None:
@@ -858,6 +890,14 @@ TEACHER_TASK_GUIDANCE = {
             "请只在当前候选题中做选择，不要发散到候选集外更理想的题；按最能朝目标再推进一步的一题来选。",
         ],
     },
+    "Congnition": {
+        "goal": "请根据学生历史题目的认知层级与作答表现，从候选题中选出认知要求最合适的一题。",
+        "basis": [
+            "重点判断候选题的认知要求是否和学生当前更适合承接的层级一致，例如低阶认知、应用或高阶认知。",
+            "历史里不仅要看对错，也要看学生最近主要完成的是哪类认知要求的题，以及是否已经具备向更高层级推进的依据。",
+            "请只在当前候选题中做选择，不要发散到候选集外更理想的题目；按这组候选里认知契合度最好的一题来选。",
+        ],
+    },
     "Personality_Individual": {
         "goal": "给定目标题目，请从候选学生中选出你最愿意把这道题推荐给的学生。",
         "basis": [
@@ -911,6 +951,9 @@ def render_question_history(items: list[dict[str, Any]], benchmark: str) -> None
     if benchmark == "Planning_Progress":
         render_history_score_table(items, "学生最近学习轨迹 / 得分记录")
         return
+    if benchmark == "Congnition":
+        render_history_score_table(items, "学生历史作答记录 / 认知层级")
+        return
     render_history_score_table(items, "学生历史作答记录")
 
 
@@ -921,6 +964,13 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
 
     if benchmark == "Planning_Target" and clean(row["learning_goal"]):
         card("学习目标", row["learning_goal"], kind="goal-card")
+    if benchmark == "Congnition":
+        if clean(row.get("cognition_target", "")):
+            card("目标认知层级", row["cognition_target"], kind="goal-card")
+        if clean(row.get("cognition_history_summary", "")):
+            card("历史认知分布", row["cognition_history_summary"], kind="goal-card")
+        if clean(row.get("cognition_candidate_summary", "")):
+            card("候选认知分布", row["cognition_candidate_summary"], kind="goal-card")
 
     if benchmark in QUESTION_TASKS:
         history = json_list(row["history_items_json"], "history_items_json", row_id)
