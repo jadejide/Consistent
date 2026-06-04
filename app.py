@@ -501,32 +501,45 @@ def render_task(row: pd.Series) -> None:
     )
 
 
-def render_history_score_table(items: list[dict[str, Any]], title: str = "学生历史作答记录") -> None:
+def render_history_score_table(
+    items: list[dict[str, Any]],
+    title: str = "学生历史作答记录",
+    show_cognition: bool = False,
+) -> None:
     """Compact score view for tasks where correctness/progress matters.
 
-    Each row carries Q号 + qid + short question hint + score, matching the
-    Personality task style so annotators do not need to map dry Q numbers
-    back to a separate question list.
+    For Congnition samples, show_cognition=True adds a cognition-level column
+    so teachers can directly compare history performance by cognitive demand.
     """
     html_block(f"<div class='section-title'>{html.escape(title)}</div>")
+
+    cognition_head = "<th>认知层级</th>" if show_cognition else ""
     rows: list[str] = []
+
     for i, item in enumerate(items, start=1):
         idx = clean(item.get("index")) or str(i)
         qid = clean(item.get("qid"))
+        cognition_cell = (
+            f"<td><span class='meta'>{html.escape(cognition_text(item))}</span></td>"
+            if show_cognition
+            else ""
+        )
+
         rows.append(
             "<tr>"
             f"<td class='qnum'>Q{html.escape(idx)}</td>"
             f"<td><span class='meta'>{html.escape(qid or '—')}</span></td>"
+            f"{cognition_cell}"
             f"<td class='qhint'>{qhtml(item.get('question_text', ''))}</td>"
             f"<td><span class='score-chip{score_class(item)}'>{html.escape(score_text(item))}</span></td>"
             "</tr>"
         )
+
     html_block(
         "<table class='score-table'>"
-        "<thead><tr><th>题号</th><th>qid</th><th>题目提示</th><th>得分</th></tr></thead>"
+        f"<thead><tr><th>题号</th><th>qid</th>{cognition_head}<th>题目提示</th><th>得分</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
-
 
 def render_history_questions(items: list[dict[str, Any]], title: str, show_score: bool) -> None:
     html_block(f"<div class='section-title'>{html.escape(title)}</div>")
@@ -541,34 +554,27 @@ def render_history_questions(items: list[dict[str, Any]], title: str, show_score
 
 
 def render_question_history(items: list[dict[str, Any]], benchmark: str) -> None:
-    """Render history exactly once for non-Personality tasks.
-
-    Personality tasks are special: teachers first read the full shared question set,
-    then compare entity score matrices with short hints. For question-recommendation
-    tasks, repeating the same history as both a table and full cards wastes visual
-    attention, so each benchmark gets one history view only.
-    """
     if benchmark == "KP_Stage":
-        # 教学进度只判断章节 / 知识阶段：只看题目，不把得分放大。
         render_history_questions(items, "学生历史题目", show_score=False)
         return
-
     if benchmark == "Planning_Progress":
-        # 学习进程必须看轨迹和得分：用个性区分同款表格，但不再重复展示完整题。
         render_history_score_table(items, "学生最近学习轨迹 / 得分记录")
         return
-
-    # 薄弱匹配和目标适配也需要看到作答表现，但只展示一次。
+    if benchmark == "Congnition":
+        render_history_score_table(items, "学生历史作答记录 / 认知层级", show_cognition=True)
+        return
     render_history_score_table(items, "学生历史作答记录")
 
-
-def render_question_candidates(items: list[dict[str, Any]]) -> None:
+def render_question_candidates(items: list[dict[str, Any]], show_cognition: bool = False) -> None:
     html_block("<div class='section-title'>候选题</div>")
-    for i, item in enumerate(items):
+    for item in items:
         label = clean(item["label"])
         qid = clean(item.get("qid"))
-        card(f"候选 {label}", item["question_text"], meta=qid, kind="candidate-card", badge=label)
-
+        meta_parts = [qid]
+        if show_cognition:
+            meta_parts.append("认知层级：" + cognition_text(item))
+        meta = " · ".join(x for x in meta_parts if x and x != "—")
+        card(f"候选 {label}", item["question_text"], meta=meta, kind="candidate-card", badge=label)
 
 def render_full_history_questions(entities: list[dict[str, Any]]) -> None:
     html_block("<div class='section-title'>完整历史题目</div>")
@@ -671,20 +677,14 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
     row_id = clean(row["row_id"])
     render_task(row)
 
-    if benchmark == "Planning_Target":
-        card("显式学习目标", row["learning_goal"], kind="goal-card")
-    if benchmark == "Planning_Progress":
-        card("学习进程状态", row["progress_state"], kind="goal-card")
-    if benchmark == "KP_Weak" and clean(row["weak_knowledge_points"]):
-        card("薄弱知识点", row["weak_knowledge_points"], kind="goal-card")
-    if benchmark == "KP_Stage" and clean(row["stage_knowledge_points"]):
-        card("当前知识阶段 / 章节", row["stage_knowledge_points"], kind="goal-card")
+    if benchmark == "Planning_Target" and clean(row["learning_goal"]):
+        card("学习目标", row["learning_goal"], kind="goal-card")
 
     if benchmark in QUESTION_TASKS:
         history = json_list(row["history_items_json"], "history_items_json", row_id)
         candidates = json_list(row["candidate_items_json"], "candidate_items_json", row_id)
         render_question_history(history, benchmark)
-        render_question_candidates(candidates)
+        render_question_candidates(candidates, show_cognition=(benchmark == "Congnition"))
         return candidates, "question"
 
     target = json_dict(row["target_question_json"], "target_question_json", row_id)
@@ -693,7 +693,6 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
     render_full_history_questions(entities)
     render_entity_candidates(entities, benchmark)
     return entities, "entity"
-
 
 def init_state(df: pd.DataFrame) -> None:
     st.session_state.setdefault("annotations", {})
@@ -814,6 +813,26 @@ def score_class(item: dict[str, Any]) -> str:
     return " score-partial"
 
 
+
+def cognition_text(item: dict[str, Any]) -> str:
+    """Return the cognition label shown to teachers for Congnition samples.
+
+    The review CSV may use different field names depending on the generator,
+    so this function checks the common cognition-label keys in order.
+    """
+    for key in [
+        "cognition_level",
+        "cognition_group_name",
+        "cognition_group",
+        "cognitive_demand_name",
+        "cognitive_demand",
+        "target_cognitive_demand_name",
+        "target_cognitive_demand",
+    ]:
+        value = clean(item.get(key))
+        if value:
+            return value
+    return "—"
 def member_total(items: list[dict[str, Any]]) -> str:
     score = 0.0
     total = 0.0
@@ -932,10 +951,9 @@ def render_question_history(items: list[dict[str, Any]], benchmark: str) -> None
         render_history_score_table(items, "学生最近学习轨迹 / 得分记录")
         return
     if benchmark == "Congnition":
-        render_history_score_table(items, "学生历史作答记录 / 认知层级")
+        render_history_score_table(items, "学生历史作答记录 / 认知层级", show_cognition=True)
         return
     render_history_score_table(items, "学生历史作答记录")
-
 
 def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
     benchmark = clean(row["benchmark"])
@@ -949,7 +967,7 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
         history = json_list(row["history_items_json"], "history_items_json", row_id)
         candidates = json_list(row["candidate_items_json"], "candidate_items_json", row_id)
         render_question_history(history, benchmark)
-        render_question_candidates(candidates)
+        render_question_candidates(candidates, show_cognition=(benchmark == "Congnition"))
         return candidates, "question"
 
     target = json_dict(row["target_question_json"], "target_question_json", row_id)
@@ -958,7 +976,6 @@ def render_left(row: pd.Series) -> tuple[list[dict[str, Any]], str]:
     render_full_history_questions(entities)
     render_entity_candidates(entities, benchmark)
     return entities, "entity"
-
 
 def main() -> None:
     st.set_page_config(page_title="教师推荐标注", layout="wide")
